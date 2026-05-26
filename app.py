@@ -144,6 +144,50 @@ def build_supplier_summary(data, shipment_df):
         sup = pd.merge(sup, cnt, how='left', on='Supplier Name')
     return sup.sort_values('Local_Total_AUD', ascending=False).reset_index(drop=True)
 
+def build_analysis_summary(billing_det, shipment_sum):
+    """Build a flat analysis summary for the Excel report."""
+    sections = {}
+
+    # KPIs
+    kpis = pd.DataFrame([{
+        'Metric': 'Total Shipments',        'Value': billing_det['Shipment Job'].nunique()
+    }, {
+        'Metric': 'Total Containers',       'Value': int(shipment_sum['Container Count'].fillna(0).sum()) if 'Container Count' in shipment_sum.columns else ''
+    }, {
+        'Metric': 'AUD Charges',            'Value': billing_det[billing_det['Currency']=='AUD']['Total'].sum()
+    }, {
+        'Metric': 'USD Charges',            'Value': billing_det[billing_det['Currency']=='USD']['Total'].sum()
+    }, {
+        'Metric': 'Total Billed (AUD)',     'Value': billing_det['Local Total'].sum()
+    }])
+    sections['kpis'] = kpis
+
+    # Spend by supplier
+    sup = billing_det.groupby('Supplier Name')['Local Total'].sum().sort_values(ascending=False).reset_index()
+    sup.columns = ['Supplier Name', 'Local Total (AUD)']
+    sections['supplier'] = sup
+
+    # Monthly AUD vs USD
+    bd_m, _ = add_month_col(billing_det, shipment_sum)
+    if bd_m is not None:
+        monthly = bd_m.groupby(['Month', 'Currency'])['Local Total'].sum().unstack(fill_value=0).reset_index()
+        monthly.columns.name = None
+        sections['monthly'] = monthly
+
+    # Top 10 charge types
+    top10 = billing_det.groupby('Description')['Local Total'].sum().sort_values(ascending=False).head(10).reset_index()
+    top10.columns = ['Charge Description', 'Local Total (AUD)']
+    sections['top10'] = top10
+
+    # By Incoterm
+    if 'Incoterms' in billing_det.columns:
+        inco = billing_det.groupby('Incoterms')['Local Total'].sum().sort_values(ascending=False).reset_index()
+        inco.columns = ['Incoterms', 'Local Total (AUD)']
+        sections['incoterm'] = inco
+
+    return sections
+
+
 def create_report(shipment_sum, billing_sum, billing_det, supplier_sum):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
@@ -151,6 +195,48 @@ def create_report(shipment_sum, billing_sum, billing_det, supplier_sum):
         billing_sum.to_excel(writer, sheet_name="Billing Summary", index=False)
         billing_det.to_excel(writer, sheet_name="Billing Detail", index=False)
         supplier_sum.to_excel(writer, sheet_name="Supplier Summary", index=False)
+
+        # Analysis sheet — stacked sections with labels
+        analysis = build_analysis_summary(billing_det, shipment_sum)
+        ws = writer.book.create_sheet("Analysis")
+        row = 1
+
+        section_labels = {
+            'kpis':     'KEY METRICS',
+            'supplier': 'SPEND BY SUPPLIER (Local AUD)',
+            'monthly':  'MONTHLY CHARGES — AUD vs USD (Local AUD)',
+            'top10':    'TOP 10 CHARGE TYPES (Local AUD)',
+            'incoterm': 'SPEND BY INCOTERM (Local AUD)',
+        }
+
+        for key, label in section_labels.items():
+            if key not in analysis:
+                continue
+            df = analysis[key]
+            # Section header
+            ws.cell(row=row, column=1, value=label)
+            from openpyxl.styles import Font, PatternFill
+            header_cell = ws.cell(row=row, column=1)
+            header_cell.font = Font(bold=True, color="FFFFFF", size=11)
+            header_cell.fill = PatternFill("solid", start_color="1A56A0")
+            row += 1
+            # Column headers
+            for col_idx, col_name in enumerate(df.columns, start=1):
+                c = ws.cell(row=row, column=col_idx, value=col_name)
+                c.font = Font(bold=True)
+            row += 1
+            # Data rows
+            for _, data_row in df.iterrows():
+                for col_idx, val in enumerate(data_row, start=1):
+                    ws.cell(row=row, column=col_idx, value=val)
+                row += 1
+            row += 1  # blank line between sections
+
+        # Auto-width columns
+        for col in ws.columns:
+            max_len = max((len(str(c.value)) for c in col if c.value), default=10)
+            ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 60)
+
     buf.seek(0)
     return buf
 
