@@ -38,6 +38,8 @@ html, body, [class*="css"] { font-family: 'Barlow', sans-serif; }
 [data-testid="stMetricLabel"] { color:#6b8cba !important; font-size:.7rem !important; text-transform:uppercase; letter-spacing:.1em; }
 div[data-testid="stVerticalBlock"] { gap:0.5rem; }
 .stAlert { background-color:#ddeeff !important; border-color:#1A56A0 !important; color:#0d2d5e !important; }
+[data-testid="stToolbar"] { display: none !important; }
+header[data-testid="stHeader"] { background: transparent !important; }
 </style>
 """, unsafe_allow_html=True)
 
