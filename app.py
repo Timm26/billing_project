@@ -118,8 +118,8 @@ def build_shipment_summary(shipment_df):
 
 def build_billing_detail(data):
     cols = ["Shipment Job","Order Reference","Supplier Name","Loading Port",
-            "Destination Port","Incoterms","Description","Currency",
-            "Amount","Tax","Total","Local Total","Exchange Rate","Containers"]
+            "Destination Port","Incoterms","Containers","Description","Currency",
+            "Amount","Tax","Total","Local Total","Exchange Rate"]
     return data[[c for c in cols if c in data.columns]].copy().reset_index(drop=True)
 
 def build_billing_summary(data, shipment_df):
@@ -191,9 +191,9 @@ def build_analysis_summary(billing_det, shipment_sum):
 def create_report(shipment_sum, billing_sum, billing_det, supplier_sum):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        billing_det.to_excel(writer, sheet_name="Billing Detail", index=False)
         shipment_sum.to_excel(writer, sheet_name="Shipment Summary", index=False)
         billing_sum.to_excel(writer, sheet_name="Billing Summary", index=False)
-        billing_det.to_excel(writer, sheet_name="Billing Detail", index=False)
         supplier_sum.to_excel(writer, sheet_name="Supplier Summary", index=False)
 
         # Analysis sheet — stacked sections with labels
@@ -376,37 +376,19 @@ with tab4:
     if bill_sum_f.empty:
         st.warning("No data matches the current filters.")
     else:
-        r1l, r1r = st.columns(2)
-
-        # Chart 1 — Spend by Supplier
-        with r1l:
-            st.markdown('<div class="section-title">Total Billed by Supplier (AUD)</div>', unsafe_allow_html=True)
-            fig1 = px.bar(
-                supp_f.sort_values('Local_Total_AUD'),
-                x='Local_Total_AUD', y='Supplier Name', orientation='h',
-                color_discrete_sequence=[BLUE],
-                labels={'Local_Total_AUD':'Local Total (AUD)','Supplier Name':''},
-                text='Local_Total_AUD',
-            )
-            fig1.update_traces(texttemplate='$%{text:,.0f}', textposition='outside',
-                               marker_line_width=0, textfont_color='#000000', marker_color=BLUE)
-            fig1.update_layout(**PLOTLY_LAYOUT, xaxis_title='', yaxis_title='')
-            st.plotly_chart(fig1, use_container_width=True)
-
-        # Chart 2 — Monthly stacked bars AUD vs USD (go.Bar for reliable stacking)
-        with r1r:
-            st.markdown('<div class="section-title">Monthly Charges — AUD vs USD Converted (Local AUD)</div>', unsafe_allow_html=True)
-            bd_m, month_order = add_month_col(bill_det_f, ship_sum_f)
-            if month_order:
-                monthly = bd_m.groupby(['Month','Currency'])['Local Total'].sum().reset_index()
-                aud_vals = [monthly[(monthly['Month']==m)&(monthly['Currency']=='AUD')]['Local Total'].sum() for m in month_order]
-                usd_vals = [monthly[(monthly['Month']==m)&(monthly['Currency']=='USD')]['Local Total'].sum() for m in month_order]
-                fig2 = go.Figure()
-                fig2.add_trace(go.Bar(name='AUD', x=month_order, y=aud_vals, marker_color=ORANGE, marker_line_width=0))
-                fig2.add_trace(go.Bar(name='USD (converted)', x=month_order, y=usd_vals, marker_color=BLUE, marker_line_width=0))
-                fig2.update_layout(**PLOTLY_LAYOUT, barmode='stack', xaxis_title='', yaxis_title='Amount (AUD)')
-                st.plotly_chart(fig2, use_container_width=True)
-                st.caption("USD charges converted to AUD using the exchange rate on each invoice line.")
+        # Chart 1 — Spend by Supplier (full width)
+        st.markdown('<div class="section-title">Total Billed by Supplier (AUD)</div>', unsafe_allow_html=True)
+        fig1 = px.bar(
+            supp_f.sort_values('Local_Total_AUD'),
+            x='Local_Total_AUD', y='Supplier Name', orientation='h',
+            color_discrete_sequence=[BLUE],
+            labels={'Local_Total_AUD':'Local Total (AUD)','Supplier Name':''},
+            text='Local_Total_AUD',
+        )
+        fig1.update_traces(texttemplate='$%{text:,.0f}', textposition='outside',
+                           marker_line_width=0, textfont_color='#000000', marker_color=BLUE)
+        fig1.update_layout(**PLOTLY_LAYOUT, xaxis_title='', yaxis_title='')
+        st.plotly_chart(fig1, use_container_width=True)
 
         r2l, r2r = st.columns(2)
 
