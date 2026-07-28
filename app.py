@@ -608,301 +608,344 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Uploads ───────────────────────────────────────────────────────────────────
+# ── Project 1: consolidated billing report ───────────────────────────────────
+# The body below is the original dashboard, unchanged apart from being wrapped
+# in a function so it can live inside a tab (st.stop() would halt the whole
+# script, including tab 2, so the two guards return instead).
 
-with st.sidebar:
-    st.markdown('<div class="section-title" style="color:#fff;border-color:'
-                + ACCENT + '">Upload files</div>', unsafe_allow_html=True)
-    billing_uploads = st.file_uploader(
-        "Billing export(s)", type=["xlsx", "csv"], accept_multiple_files=True)
-    shipment_upload = st.file_uploader("Shipment listing report", type=["xlsx", "csv"])
-    st.caption(f"Signed in as {st.session_state['auth_user']}")
-    if st.button("Sign out"):
-        st.session_state.clear()
-        st.rerun()
+def render_billing_report():
+    # ── Uploads ───────────────────────────────────────────────────────────────────
 
-if not billing_uploads or not shipment_upload:
-    st.info("Upload the billing export(s) and the shipment listing report in the sidebar to begin.")
-    st.stop()
+    with st.sidebar:
+        st.markdown('<div class="section-title" style="color:#fff;border-color:'
+                    + ACCENT + '">Upload files</div>', unsafe_allow_html=True)
+        billing_uploads = st.file_uploader(
+            "Billing export(s)", type=["xlsx", "csv"], accept_multiple_files=True)
+        shipment_upload = st.file_uploader("Shipment listing report", type=["xlsx", "csv"])
+        st.caption(f"Signed in as {st.session_state['auth_user']}")
+        if st.button("Sign out"):
+            st.session_state.clear()
+            st.rerun()
 
-with st.spinner("Processing files…"):
-    result = load_data(billing_uploads, shipment_upload)
-if result is None:
-    st.error("The files could not be loaded. Check that both exports match the expected columns.")
-    st.stop()
+    if not billing_uploads or not shipment_upload:
+        st.info("Upload the billing export(s) and the shipment listing report in the sidebar to begin.")
+        return
 
-data, shipment_df = result
-ship_sum = build_shipment_summary(shipment_df)
-bill_det = build_billing_detail(data)
-bill_sum = build_billing_summary(data, shipment_df)
-supp_sum = build_supplier_summary(data, shipment_df)
-billed_jobs = set(data["Shipment Job"].dropna())
+    with st.spinner("Processing files…"):
+        result = load_data(billing_uploads, shipment_upload)
+    if result is None:
+        st.error("The files could not be loaded. Check that both exports match the expected columns.")
+        return
 
-bd_all, all_months = add_month_col(bill_det, ship_sum)
+    data, shipment_df = result
+    ship_sum = build_shipment_summary(shipment_df)
+    bill_det = build_billing_detail(data)
+    bill_sum = build_billing_summary(data, shipment_df)
+    supp_sum = build_supplier_summary(data, shipment_df)
+    billed_jobs = set(data["Shipment Job"].dropna())
 
-# ── Filters ───────────────────────────────────────────────────────────────────
+    bd_all, all_months = add_month_col(bill_det, ship_sum)
 
-with st.sidebar:
-    st.markdown("---")
-    st.markdown('<div class="section-title" style="color:#fff;border-color:'
-                + ACCENT + '">Filters</div>', unsafe_allow_html=True)
-    billed_ship = ship_sum[ship_sum["Shipment Job"].isin(billed_jobs)]
+    # ── Filters ───────────────────────────────────────────────────────────────────
 
-    def options(col):
-        if col not in billed_ship.columns:
-            return []
-        return sorted(billed_ship[col].dropna().unique())
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown('<div class="section-title" style="color:#fff;border-color:'
+                    + ACCENT + '">Filters</div>', unsafe_allow_html=True)
+        billed_ship = ship_sum[ship_sum["Shipment Job"].isin(billed_jobs)]
 
-    f_month = st.multiselect("Month (ETD)", all_months, placeholder="All months")
-    f_supplier = st.multiselect("Supplier", options("Supplier Name"), placeholder="All suppliers")
-    f_origin = st.multiselect("Loading port", options("Loading Port"), placeholder="All loading ports")
-    f_dest = st.multiselect("Destination port", options("Destination Port"), placeholder="All destinations")
-    f_inco = st.multiselect("Incoterms", options("Incoterms"), placeholder="All Incoterms")
-    f_mode = st.multiselect("Mode", options("Mode"), placeholder="All modes")
-    st.markdown("---")
-    st.markdown('<div class="section-title" style="color:#fff;border-color:'
-                + ACCENT + '">Download</div>', unsafe_allow_html=True)
+        def options(col):
+            if col not in billed_ship.columns:
+                return []
+            return sorted(billed_ship[col].dropna().unique())
 
-
-def filter_df(df):
-    m = pd.Series(True, index=df.index)
-    for values, col in (
-        (f_supplier, "Supplier Name"),
-        (f_origin, "Loading Port"),
-        (f_dest, "Destination Port"),
-        (f_inco, "Incoterms"),
-        (f_mode, "Mode"),
-    ):
-        if values and col in df.columns:
-            m &= df[col].isin(values)
-    return df[m]
+        f_month = st.multiselect("Month (ETD)", all_months, placeholder="All months")
+        f_supplier = st.multiselect("Supplier", options("Supplier Name"), placeholder="All suppliers")
+        f_origin = st.multiselect("Loading port", options("Loading Port"), placeholder="All loading ports")
+        f_dest = st.multiselect("Destination port", options("Destination Port"), placeholder="All destinations")
+        f_inco = st.multiselect("Incoterms", options("Incoterms"), placeholder="All Incoterms")
+        f_mode = st.multiselect("Mode", options("Mode"), placeholder="All modes")
+        st.markdown("---")
+        st.markdown('<div class="section-title" style="color:#fff;border-color:'
+                    + ACCENT + '">Download</div>', unsafe_allow_html=True)
 
 
-bill_sum_f = filter_df(bill_sum)
+    def filter_df(df):
+        m = pd.Series(True, index=df.index)
+        for values, col in (
+            (f_supplier, "Supplier Name"),
+            (f_origin, "Loading Port"),
+            (f_dest, "Destination Port"),
+            (f_inco, "Incoterms"),
+            (f_mode, "Mode"),
+        ):
+            if values and col in df.columns:
+                m &= df[col].isin(values)
+        return df[m]
 
-if f_month:
-    jobs_in_month = bd_all[bd_all["Month"].isin(f_month)]["Shipment Job"].unique()
-    bill_sum_f = bill_sum_f[bill_sum_f["Shipment Job"].isin(jobs_in_month)]
 
-kept = bill_sum_f["Shipment Job"]
-ship_sum_f = ship_sum[ship_sum["Shipment Job"].isin(kept)]
-bill_det_f = bill_det[bill_det["Shipment Job"].isin(kept)]
-fdata = data[data["Shipment Job"].isin(kept)]
-fship = shipment_df[shipment_df["Shipment Job"].isin(kept)]
-supp_f = build_supplier_summary(fdata, fship) if not fdata.empty else supp_sum
+    bill_sum_f = filter_df(bill_sum)
 
-# ── KPIs ──────────────────────────────────────────────────────────────────────
+    if f_month:
+        jobs_in_month = bd_all[bd_all["Month"].isin(f_month)]["Shipment Job"].unique()
+        bill_sum_f = bill_sum_f[bill_sum_f["Shipment Job"].isin(jobs_in_month)]
 
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Shipments", f"{bill_sum_f['Shipment Job'].nunique():,}")
-k2.metric("Containers", f"{int(ship_sum_f['Container Count'].fillna(0).sum()):,}"
-          if "Container Count" in ship_sum_f.columns else "—")
-k3.metric(f"{BASE_CCY} charges",
-          f"{bill_det_f[bill_det_f['Currency'] == BASE_CCY]['Total'].sum():,.2f}")
-k4.metric(f"{FX_CCY} charges",
-          f"{bill_det_f[bill_det_f['Currency'] == FX_CCY]['Total'].sum():,.2f}")
-k5.metric(f"Total ({BASE_CCY})", f"{bill_det_f['Local Total'].sum():,.2f}")
+    kept = bill_sum_f["Shipment Job"]
+    ship_sum_f = ship_sum[ship_sum["Shipment Job"].isin(kept)]
+    bill_det_f = bill_det[bill_det["Shipment Job"].isin(kept)]
+    fdata = data[data["Shipment Job"].isin(kept)]
+    fship = shipment_df[shipment_df["Shipment Job"].isin(kept)]
+    supp_f = build_supplier_summary(fdata, fship) if not fdata.empty else supp_sum
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
+    # ── KPIs ──────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab6, tab5 = st.tabs([
-    "Shipment summary", "Billing summary", "Billing detail", "Analysis",
-    "Charge by container", "Download",
-])
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Shipments", f"{bill_sum_f['Shipment Job'].nunique():,}")
+    k2.metric("Containers", f"{int(ship_sum_f['Container Count'].fillna(0).sum()):,}"
+              if "Container Count" in ship_sum_f.columns else "—")
+    k3.metric(f"{BASE_CCY} charges",
+              f"{bill_det_f[bill_det_f['Currency'] == BASE_CCY]['Total'].sum():,.2f}")
+    k4.metric(f"{FX_CCY} charges",
+              f"{bill_det_f[bill_det_f['Currency'] == FX_CCY]['Total'].sum():,.2f}")
+    k5.metric(f"Total ({BASE_CCY})", f"{bill_det_f['Local Total'].sum():,.2f}")
 
-with tab1:
-    st.markdown('<div class="section-title">Shipment summary</div>', unsafe_allow_html=True)
-    st.dataframe(ship_sum_f, use_container_width=True, hide_index=True)
-    containers = (int(ship_sum_f["Container Count"].fillna(0).sum())
-                  if "Container Count" in ship_sum_f.columns else 0)
-    st.caption(f"{len(ship_sum_f)} shipments · {containers} containers")
+    # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-with tab2:
-    st.markdown('<div class="section-title">Billing summary — per job</div>', unsafe_allow_html=True)
-    st.dataframe(bill_sum_f, use_container_width=True, hide_index=True)
-    base_total = bill_sum_f[BASE_CCY].sum() if BASE_CCY in bill_sum_f.columns else 0
-    fx_total = bill_sum_f[FX_CCY].sum() if FX_CCY in bill_sum_f.columns else 0
-    local_total = bill_sum_f[LOCAL_LABEL].sum() if LOCAL_LABEL in bill_sum_f.columns else 0
-    st.caption(f"{BASE_CCY} {base_total:,.2f}  ·  {FX_CCY} {fx_total:,.2f}  "
-               f"·  {LOCAL_LABEL} {local_total:,.2f}")
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "Shipment summary", "Billing summary", "Billing detail", "Analysis", "Download",
+        ])
 
-with tab3:
-    st.markdown('<div class="section-title">Billing detail — all charge lines</div>', unsafe_allow_html=True)
-    st.dataframe(bill_det_f, use_container_width=True, hide_index=True)
-    st.caption(f"{len(bill_det_f):,} charge lines")
+    with tab1:
+        st.markdown('<div class="section-title">Shipment summary</div>', unsafe_allow_html=True)
+        st.dataframe(ship_sum_f, use_container_width=True, hide_index=True)
+        containers = (int(ship_sum_f["Container Count"].fillna(0).sum())
+                      if "Container Count" in ship_sum_f.columns else 0)
+        st.caption(f"{len(ship_sum_f)} shipments · {containers} containers")
 
-with tab4:
-    if bill_sum_f.empty:
-        st.warning("No shipments match the current filters. Clear a filter to see data.")
-    else:
-        st.markdown(f'<div class="section-title">Total billed by supplier ({BASE_CCY})</div>',
-                    unsafe_allow_html=True)
-        fig1 = px.bar(
-            supp_f.sort_values(SUPPLIER_TOTAL_COL),
-            x=SUPPLIER_TOTAL_COL, y="Supplier Name", orientation="h",
-            color_discrete_sequence=[PRIMARY],
-            labels={SUPPLIER_TOTAL_COL: LOCAL_LABEL, "Supplier Name": ""},
-            text=SUPPLIER_TOTAL_COL,
-        )
-        fig1.update_traces(texttemplate="%{text:,.0f}", textposition="outside",
-                           marker_line_width=0, textfont_color=TEXT, marker_color=PRIMARY)
-        fig1.update_layout(**PLOTLY_LAYOUT, xaxis_title="", yaxis_title="")
-        st.plotly_chart(fig1, use_container_width=True)
+    with tab2:
+        st.markdown('<div class="section-title">Billing summary — per job</div>', unsafe_allow_html=True)
+        st.dataframe(bill_sum_f, use_container_width=True, hide_index=True)
+        base_total = bill_sum_f[BASE_CCY].sum() if BASE_CCY in bill_sum_f.columns else 0
+        fx_total = bill_sum_f[FX_CCY].sum() if FX_CCY in bill_sum_f.columns else 0
+        local_total = bill_sum_f[LOCAL_LABEL].sum() if LOCAL_LABEL in bill_sum_f.columns else 0
+        st.caption(f"{BASE_CCY} {base_total:,.2f}  ·  {FX_CCY} {fx_total:,.2f}  "
+                   f"·  {LOCAL_LABEL} {local_total:,.2f}")
 
-        r2l, r2r = st.columns(2)
+    with tab3:
+        st.markdown('<div class="section-title">Billing detail — all charge lines</div>', unsafe_allow_html=True)
+        st.dataframe(bill_det_f, use_container_width=True, hide_index=True)
+        st.caption(f"{len(bill_det_f):,} charge lines")
 
-        with r2l:
-            st.markdown(f'<div class="section-title">Top 10 charge types ({BASE_CCY})</div>',
+    with tab4:
+        if bill_sum_f.empty:
+            st.warning("No shipments match the current filters. Clear a filter to see data.")
+        else:
+            st.markdown(f'<div class="section-title">Total billed by supplier ({BASE_CCY})</div>',
                         unsafe_allow_html=True)
-            top10 = (bill_det_f.groupby("Description")["Local Total"].sum()
-                     .sort_values(ascending=False).head(10).index.tolist())
-            charge_stack = (bill_det_f[bill_det_f["Description"].isin(top10)]
-                            .groupby(["Description", "Currency"])["Local Total"].sum().reset_index())
-            charge_stack["rank"] = charge_stack["Description"].map(
-                {d: i for i, d in enumerate(reversed(top10))})
-            charge_stack = charge_stack.sort_values("rank")
-            fig3 = px.bar(
-                charge_stack, x="Local Total", y="Description", color="Currency",
-                orientation="h", color_discrete_map={BASE_CCY: ACCENT, FX_CCY: PRIMARY},
-                barmode="stack", labels={"Local Total": LOCAL_LABEL, "Description": ""},
+            fig1 = px.bar(
+                supp_f.sort_values(SUPPLIER_TOTAL_COL),
+                x=SUPPLIER_TOTAL_COL, y="Supplier Name", orientation="h",
+                color_discrete_sequence=[PRIMARY],
+                labels={SUPPLIER_TOTAL_COL: LOCAL_LABEL, "Supplier Name": ""},
+                text=SUPPLIER_TOTAL_COL,
             )
-            fig3.update_layout(**PLOTLY_LAYOUT, xaxis_title="", yaxis_title="")
-            fig3.update_traces(marker_line_width=0)
-            st.plotly_chart(fig3, use_container_width=True)
-            st.caption(f"Non-{BASE_CCY} charges are shown converted to {BASE_CCY}.")
+            fig1.update_traces(texttemplate="%{text:,.0f}", textposition="outside",
+                               marker_line_width=0, textfont_color=TEXT, marker_color=PRIMARY)
+            fig1.update_layout(**PLOTLY_LAYOUT, xaxis_title="", yaxis_title="")
+            st.plotly_chart(fig1, use_container_width=True)
 
-        with r2r:
-            st.markdown('<div class="section-title">Shipments by Incoterms</div>', unsafe_allow_html=True)
-            if "Incoterms" in ship_sum_f.columns:
-                inco_data = ship_sum_f.groupby("Incoterms")["Shipment Job"].nunique().reset_index()
-                inco_data.columns = ["Incoterms", "Shipments"]
-                fig4 = px.pie(inco_data, values="Shipments", names="Incoterms",
-                              color_discrete_sequence=PALETTE, hole=0.45)
-                fig4.update_layout(**PLOTLY_LAYOUT)
-                fig4.update_traces(textfont_color="#ffffff", textfont_size=13)
-                st.plotly_chart(fig4, use_container_width=True)
+            r2l, r2r = st.columns(2)
 
-        st.markdown(f'<div class="section-title">Monthly spend by Incoterm ({BASE_CCY})</div>',
-                    unsafe_allow_html=True)
-        bd_m2, month_order2 = add_month_col(bill_det_f, ship_sum_f)
-        if month_order2 and "Incoterms" in bd_m2.columns:
-            inco_monthly = bd_m2.groupby(["Month", "Incoterms"])["Local Total"].sum().reset_index()
-            inco_monthly = inco_monthly[inco_monthly["Local Total"] > 0]
-            inco_monthly["Month"] = pd.Categorical(
-                inco_monthly["Month"], categories=month_order2, ordered=True)
-            inco_monthly = inco_monthly.sort_values("Month")
-            fig5 = px.line(
-                inco_monthly, x="Month", y="Local Total", color="Incoterms",
-                color_discrete_sequence=PALETTE, markers=True,
-                labels={"Local Total": LOCAL_LABEL, "Month": ""},
-            )
-            fig5.update_layout(**PLOTLY_LAYOUT, xaxis_title="", yaxis_title=LOCAL_LABEL)
-            fig5.update_traces(line_width=2.5, marker_size=8)
-            st.plotly_chart(fig5, use_container_width=True)
-            st.caption("Each line tracks total spend per Incoterm by ETD month.")
-        else:
-            st.info("Add shipments with ETD dates and Incoterms to see the monthly trend.")
+            with r2l:
+                st.markdown(f'<div class="section-title">Top 10 charge types ({BASE_CCY})</div>',
+                            unsafe_allow_html=True)
+                top10 = (bill_det_f.groupby("Description")["Local Total"].sum()
+                         .sort_values(ascending=False).head(10).index.tolist())
+                charge_stack = (bill_det_f[bill_det_f["Description"].isin(top10)]
+                                .groupby(["Description", "Currency"])["Local Total"].sum().reset_index())
+                charge_stack["rank"] = charge_stack["Description"].map(
+                    {d: i for i, d in enumerate(reversed(top10))})
+                charge_stack = charge_stack.sort_values("rank")
+                fig3 = px.bar(
+                    charge_stack, x="Local Total", y="Description", color="Currency",
+                    orientation="h", color_discrete_map={BASE_CCY: ACCENT, FX_CCY: PRIMARY},
+                    barmode="stack", labels={"Local Total": LOCAL_LABEL, "Description": ""},
+                )
+                fig3.update_layout(**PLOTLY_LAYOUT, xaxis_title="", yaxis_title="")
+                fig3.update_traces(marker_line_width=0)
+                st.plotly_chart(fig3, use_container_width=True)
+                st.caption(f"Non-{BASE_CCY} charges are shown converted to {BASE_CCY}.")
 
-        st.markdown('<div class="section-title">Supplier summary</div>', unsafe_allow_html=True)
-        st.dataframe(supp_f, use_container_width=True, hide_index=True)
+            with r2r:
+                st.markdown('<div class="section-title">Shipments by Incoterms</div>', unsafe_allow_html=True)
+                if "Incoterms" in ship_sum_f.columns:
+                    inco_data = ship_sum_f.groupby("Incoterms")["Shipment Job"].nunique().reset_index()
+                    inco_data.columns = ["Incoterms", "Shipments"]
+                    fig4 = px.pie(inco_data, values="Shipments", names="Incoterms",
+                                  color_discrete_sequence=PALETTE, hole=0.45)
+                    fig4.update_layout(**PLOTLY_LAYOUT)
+                    fig4.update_traces(textfont_color="#ffffff", textfont_size=13)
+                    st.plotly_chart(fig4, use_container_width=True)
 
-with tab6:
-    st.markdown('<div class="section-title">Charge by container</div>', unsafe_allow_html=True)
-    st.caption(
-        "Every charge line on the selected shipments, allocated evenly across that "
-        f"job's containers. Amounts are GST-exclusive, in {BASE_CCY}, and each "
-        "charge's shares add back to the invoiced figure to the cent."
-    )
+            st.markdown(f'<div class="section-title">Monthly spend by Incoterm ({BASE_CCY})</div>',
+                        unsafe_allow_html=True)
+            bd_m2, month_order2 = add_month_col(bill_det_f, ship_sum_f)
+            if month_order2 and "Incoterms" in bd_m2.columns:
+                inco_monthly = bd_m2.groupby(["Month", "Incoterms"])["Local Total"].sum().reset_index()
+                inco_monthly = inco_monthly[inco_monthly["Local Total"] > 0]
+                inco_monthly["Month"] = pd.Categorical(
+                    inco_monthly["Month"], categories=month_order2, ordered=True)
+                inco_monthly = inco_monthly.sort_values("Month")
+                fig5 = px.line(
+                    inco_monthly, x="Month", y="Local Total", color="Incoterms",
+                    color_discrete_sequence=PALETTE, markers=True,
+                    labels={"Local Total": LOCAL_LABEL, "Month": ""},
+                )
+                fig5.update_layout(**PLOTLY_LAYOUT, xaxis_title="", yaxis_title=LOCAL_LABEL)
+                fig5.update_traces(line_width=2.5, marker_size=8)
+                st.plotly_chart(fig5, use_container_width=True)
+                st.caption("Each line tracks total spend per Incoterm by ETD month.")
+            else:
+                st.info("Add shipments with ETD dates and Incoterms to see the monthly trend.")
 
-    invoice_source = fdata if not fdata.empty else data
-    cbc, diag = build_charge_by_container(invoice_source, shipment_df)
+            st.markdown('<div class="section-title">Supplier summary</div>', unsafe_allow_html=True)
+            st.dataframe(supp_f, use_container_width=True, hide_index=True)
 
-    if diag["missing_columns"]:
-        st.error("The billing export is missing: " + ", ".join(diag["missing_columns"]))
-    elif cbc.empty:
-        st.warning("No charge lines to allocate for the current filters.")
-    else:
-        if diag["invoice_number_source"]:
-            st.caption(f"Invoice number read from the '{diag['invoice_number_source']}' column.")
-        else:
-            st.warning(
-                "No invoice number column found in the billing export, so rows are "
-                "grouped by job only and the invoice columns are blank. Add the invoice "
-                "number to the CargoWise export to populate them."
-            )
-        if diag["jobs_without_containers"]:
-            st.info(
-                f"{len(diag['jobs_without_containers'])} job(s) have no container listed "
-                "in the shipment report; their charges sit on a single "
-                f"'{NO_CONTAINER_LABEL}' row so nothing is dropped."
-            )
-
-        template = st.file_uploader(
-            "Optional: upload an existing report to copy its column order",
-            type=["csv"], key="cbc_template")
-        if template is not None:
-            try:
-                template_cols = list(pd.read_csv(template, nrows=0).columns)
-                cbc = reorder_to_template(cbc, template_cols)
-            except Exception as e:
-                st.error(f"Could not read the template header: {e}")
-
-        code_count = len([c for c in cbc.columns if c not in (
-            JOB_LABEL, CONTAINER_LABEL, COMMERCIAL_REF_LABEL,
-            INVOICE_NUMBER_LABEL, INVOICE_DATE_LABEL, "TOTAL")])
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Rows", f"{len(cbc):,}")
-        m2.metric("Containers", f"{cbc[CONTAINER_LABEL].nunique():,}")
-        m3.metric("Charge codes", f"{code_count:,}")
-        m4.metric(f"Allocated ({BASE_CCY})", f"{cbc['TOTAL'].sum():,.2f}")
-
-        st.dataframe(cbc, use_container_width=True, hide_index=True)
-
+    with tab5:
+        st.markdown('<div class="section-title">Download consolidated report</div>', unsafe_allow_html=True)
+        active = any([f_supplier, f_origin, f_dest, f_inco, f_mode, f_month])
+        scope = (f"**{len(bill_sum_f)} of {len(bill_sum)} shipments** match the current filters."
+                 if active else f"**All {len(bill_sum)} billed shipments** are included.")
+        st.info(scope)
         st.download_button(
-            label="Download charge by container (CSV)",
-            data=cbc.to_csv(index=False).encode("utf-8"),
-            file_name=INVOICE_CSV_FILENAME,
-            mime="text/csv",
+            label="Download Excel report",
+            data=create_report(ship_sum_f, bill_sum_f, bill_det_f, supp_f),
+            file_name=REPORT_FILENAME,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-
-        # Reconciliation: allocated total must equal the source charge total.
-        source_total = pd.to_numeric(
-            invoice_source[CHARGE_AMOUNT_COL], errors="coerce").fillna(0).sum()
-        difference = round(cbc["TOTAL"].sum() - source_total, 2)
-        if abs(difference) < 0.01:
-            st.success(f"Reconciled: allocated total matches the billing export "
-                       f"({source_total:,.2f} {BASE_CCY}).")
-        else:
-            st.error(f"Allocated total is out by {difference:,.2f} {BASE_CCY} versus the "
-                     f"billing export ({source_total:,.2f}). Check for charge lines "
-                     "whose job is missing from the shipment report.")
-
-with tab5:
-    st.markdown('<div class="section-title">Download consolidated report</div>', unsafe_allow_html=True)
-    active = any([f_supplier, f_origin, f_dest, f_inco, f_mode, f_month])
-    scope = (f"**{len(bill_sum_f)} of {len(bill_sum)} shipments** match the current filters."
-             if active else f"**All {len(bill_sum)} billed shipments** are included.")
-    st.info(scope)
-    st.download_button(
-        label="Download Excel report",
-        data=create_report(ship_sum_f, bill_sum_f, bill_det_f, supp_f),
-        file_name=REPORT_FILENAME,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.markdown(f"""
+        st.markdown(f"""
 **Sheets included:**
 - **Shipment Summary** — one row per shipment
 - **Billing Summary** — per-job {BASE_CCY} / {FX_CCY} / {LOCAL_LABEL}
 - **Billing Detail** — every charge line
 - **Supplier Summary** — shipment count and spend per supplier
 - **Analysis** — key metrics and spend breakdowns
-    """)
+        """)
 
-with st.sidebar:
-    st.download_button(
-        label="Download report",
-        data=create_report(ship_sum_f, bill_sum_f, bill_det_f, supp_f),
-        file_name=REPORT_FILENAME,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    with st.sidebar:
+        st.download_button(
+            label="Download report",
+            data=create_report(ship_sum_f, bill_sum_f, bill_det_f, supp_f),
+            file_name=REPORT_FILENAME,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.caption(f"{len(bill_sum_f)} shipments in the current export")
+
+
+# ── Project 2: charge by container ────────────────────────────────────────────
+# Self-contained: its own uploaders live in the tab body (not the sidebar) so
+# this project never interferes with project 1's controls.
+
+def render_charge_by_container():
+    st.markdown('<div class="section-title">Charge by container</div>', unsafe_allow_html=True)
+    st.caption(
+        "Allocates every charge line evenly across the containers on its job and "
+        "pivots the result to one row per invoice and container, one column per "
+        f"charge code. Amounts are GST-exclusive, in {BASE_CCY}, and each charge's "
+        "shares add back to the invoiced figure to the cent."
     )
-    st.caption(f"{len(bill_sum_f)} shipments in the current export")
+
+    left, right = st.columns(2)
+    with left:
+        billing_files = st.file_uploader(
+            "Billing export(s)", type=["xlsx", "csv"],
+            accept_multiple_files=True, key="cbc_billing")
+    with right:
+        shipment_file = st.file_uploader(
+            "Shipment listing report", type=["xlsx", "csv"], key="cbc_shipment")
+
+    if not billing_files or not shipment_file:
+        st.info("Upload the billing export(s) and the shipment listing report to build "
+                "the allocation. The container numbers come from the shipment report.")
+        return
+
+    with st.spinner("Allocating charges…"):
+        sheets = [read_billing(f) for f in billing_files]
+        sheets = [s for s in sheets if s is not None]
+        shipment = read_shipment(shipment_file)
+    if not sheets or shipment is None:
+        st.error("The files could not be read.")
+        return
+
+    billing = pd.concat(sheets, ignore_index=True)
+    cbc, diag = build_charge_by_container(billing, shipment)
+
+    if diag["missing_columns"]:
+        st.error("The billing export is missing: " + ", ".join(diag["missing_columns"]))
+        return
+    if cbc.empty:
+        st.warning("No non-zero charge lines found to allocate.")
+        return
+
+    if diag["invoice_number_source"]:
+        st.caption(f"Invoice number read from the '{diag['invoice_number_source']}' column.")
+    else:
+        st.warning(
+            "No invoice number column was found in the billing export, so rows are "
+            "grouped by charge date and the invoice columns are left blank. Add the "
+            "invoice number to the export and it will be picked up automatically."
+        )
+    if diag["jobs_without_containers"]:
+        st.info(
+            f"{len(diag['jobs_without_containers'])} job(s) have no container listed in "
+            f"the shipment report; their charges sit on a '{NO_CONTAINER_LABEL}' row so "
+            "nothing is dropped from the totals."
+        )
+
+    template = st.file_uploader(
+        "Optional: upload an existing report to copy its column order",
+        type=["csv"], key="cbc_template")
+    if template is not None:
+        try:
+            cbc = reorder_to_template(cbc, list(pd.read_csv(template, nrows=0).columns))
+        except Exception as e:
+            st.error(f"Could not read the template header: {e}")
+
+    meta_cols = (JOB_LABEL, CONTAINER_LABEL, COMMERCIAL_REF_LABEL,
+                 INVOICE_NUMBER_LABEL, INVOICE_DATE_LABEL, "TOTAL")
+    code_count = len([c for c in cbc.columns if c not in meta_cols])
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Rows", f"{len(cbc):,}")
+    m2.metric("Containers", f"{cbc[CONTAINER_LABEL].nunique():,}")
+    m3.metric("Charge codes", f"{code_count:,}")
+    m4.metric(f"Allocated ({BASE_CCY})", f"{cbc['TOTAL'].sum():,.2f}")
+
+    st.dataframe(cbc, use_container_width=True, hide_index=True)
+
+    st.download_button(
+        label="Download charge by container (CSV)",
+        data=cbc.to_csv(index=False).encode("utf-8"),
+        file_name=INVOICE_CSV_FILENAME,
+        mime="text/csv",
+    )
+
+    source_total = pd.to_numeric(billing[CHARGE_AMOUNT_COL], errors="coerce").fillna(0).sum()
+    difference = round(cbc["TOTAL"].sum() - source_total, 2)
+    if abs(difference) < 0.01:
+        st.success(f"Reconciled: the allocation matches the billing export "
+                   f"({source_total:,.2f} {BASE_CCY}).")
+    else:
+        st.error(f"The allocation is out by {difference:,.2f} {BASE_CCY} against the "
+                 f"billing export ({source_total:,.2f}).")
+
+
+# ── Projects ──────────────────────────────────────────────────────────────────
+
+project_1, project_2 = st.tabs(["Billing report", "Charge by container"])
+
+with project_1:
+    render_billing_report()
+
+with project_2:
+    render_charge_by_container()
