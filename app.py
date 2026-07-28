@@ -101,7 +101,7 @@ PALETTE = [ACCENT, PRIMARY, "#5B8FB9", "#8FBF9F", "#B08EA2", "#C98B5E", "#6E7B8B
 st.set_page_config(
     page_title=APP_TITLE,
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ── Styling ───────────────────────────────────────────────────────────────────
@@ -111,11 +111,7 @@ CSS = Template("""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .stApp { background-color: $bg; color: $text; }
-[data-testid="stSidebar"] { background-color: $primary !important; border-right: none; }
-[data-testid="stSidebar"] * { color: #ffffff !important; }
-[data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] { background-color: $accent !important; color: #ffffff !important; }
-[data-testid="stSidebar"] [data-baseweb="select"] { background-color: $control !important; }
-[data-testid="stSidebar"] [data-baseweb="select"] * { background-color: $control !important; color: #ffffff !important; border-color: $primary_light !important; }
+.stMultiSelect [data-baseweb="tag"] { background-color: $accent !important; color: #ffffff !important; }
 .app-header { background: linear-gradient(90deg,$primary 0%,$primary_light 100%); border-bottom:4px solid $accent; padding:20px 32px; margin:-1rem -1rem 2rem -1rem; display:flex; align-items:center; gap:20px; }
 .app-header h1 { font-size:1.7rem; font-weight:700; color:#fff; margin:0; letter-spacing:.01em; }
 .app-subtitle { font-size:.78rem; color:#c8d6e5; letter-spacing:.08em; text-transform:uppercase; margin-top:4px; }
@@ -126,7 +122,7 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .stTabs [aria-selected="true"] { color:$primary !important; border-bottom:3px solid $accent !important; }
 .stDownloadButton button, .stButton button { background-color:$accent !important; color:#fff !important; font-weight:600 !important; letter-spacing:.06em !important; text-transform:uppercase !important; border:none !important; border-radius:4px !important; padding:10px 28px !important; }
 .stDownloadButton button:hover, .stButton button:hover { background-color:$accent_dark !important; }
-[data-testid="stFileUploader"] { background-color:$control; border:2px dashed $primary_light; border-radius:6px; padding:8px; }
+[data-testid="stFileUploader"] { background-color:$surface; border:2px dashed $border; border-radius:6px; padding:10px; }
 [data-testid="metric-container"] { background-color:$surface; border:1px solid $border; border-top:4px solid $accent; padding:16px; border-radius:6px; box-shadow:0 2px 8px rgba(27,42,56,.08); }
 [data-testid="stMetricValue"] { font-size:1.8rem !important; font-weight:700 !important; color:$primary !important; }
 [data-testid="stMetricLabel"] { color:$muted !important; font-size:.7rem !important; text-transform:uppercase; letter-spacing:.1em; }
@@ -134,16 +130,11 @@ div[data-testid="stVerticalBlock"] { gap:0.5rem; }
 .stAlert { background-color:$grid !important; border-color:$primary !important; color:$text !important; }
 [data-testid="stToolbar"] { display: none !important; }
 header[data-testid="stHeader"] { background: transparent !important; }
-/* Keep the sidebar visible and expanded at all times */
+/* No sidebar in this app: hide it and its expand control entirely */
 [data-testid="stSidebar"],
-[data-testid="stSidebar"][aria-expanded="false"] {
-    transform: none !important;
-    visibility: visible !important;
-    margin-left: 0 !important;
-    min-width: 244px !important;
-    width: 244px !important;
-}
-[data-testid="stSidebarCollapseButton"] { display: none !important; }
+[data-testid="stSidebarCollapseButton"],
+[data-testid="collapsedControl"],
+[data-testid="stSidebarCollapsedControl"] { display: none !important; }
 </style>
 """).safe_substitute(
     bg=BG, text=TEXT, primary=PRIMARY, primary_light=PRIMARY_LIGHT,
@@ -200,11 +191,6 @@ def password_matches(stored, supplied):
 
 def login_screen():
     """Render the sign-in form. Never returns if the visitor is not signed in."""
-    st.markdown(
-        '<style>[data-testid="stSidebar"], [data-testid="stSidebar"][aria-expanded="false"]'
-        '{ display:none !important; }</style>',
-        unsafe_allow_html=True,
-    )
     st.markdown(f"""
     <div class="app-header">
       <div>
@@ -609,26 +595,25 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── Project 1: consolidated billing report ───────────────────────────────────
-# The body below is the original dashboard, unchanged apart from being wrapped
-# in a function so it can live inside a tab (st.stop() would halt the whole
-# script, including tab 2, so the two guards return instead).
+# The original dashboard, wrapped in a function so it can live inside a tab
+# (st.stop() would halt the whole script, including tab 2, so the guards
+# return instead). Uploads and the download button sit at the top of the tab.
 
 def render_billing_report():
     # ── Uploads ───────────────────────────────────────────────────────────────────
 
-    with st.sidebar:
-        st.markdown('<div class="section-title" style="color:#fff;border-color:'
-                    + ACCENT + '">Upload files</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Upload files</div>', unsafe_allow_html=True)
+    up_left, up_right = st.columns(2)
+    with up_left:
         billing_uploads = st.file_uploader(
-            "Billing export(s)", type=["xlsx", "csv"], accept_multiple_files=True)
-        shipment_upload = st.file_uploader("Shipment listing report", type=["xlsx", "csv"])
-        st.caption(f"Signed in as {st.session_state['auth_user']}")
-        if st.button("Sign out"):
-            st.session_state.clear()
-            st.rerun()
+            "Billing export(s)", type=["xlsx", "csv"],
+            accept_multiple_files=True, key="br_billing")
+    with up_right:
+        shipment_upload = st.file_uploader(
+            "Shipment listing report", type=["xlsx", "csv"], key="br_shipment")
 
     if not billing_uploads or not shipment_upload:
-        st.info("Upload the billing export(s) and the shipment listing report in the sidebar to begin.")
+        st.info("Upload the billing export(s) and the shipment listing report to begin.")
         return
 
     with st.spinner("Processing files…"):
@@ -646,12 +631,13 @@ def render_billing_report():
 
     bd_all, all_months = add_month_col(bill_det, ship_sum)
 
+    # The download button sits directly under the upload fields. It is rendered
+    # into this slot at the end, once the filters below have been applied.
+    download_slot = st.container()
+
     # ── Filters ───────────────────────────────────────────────────────────────────
 
-    with st.sidebar:
-        st.markdown("---")
-        st.markdown('<div class="section-title" style="color:#fff;border-color:'
-                    + ACCENT + '">Filters</div>', unsafe_allow_html=True)
+    with st.expander("Filters", expanded=False):
         billed_ship = ship_sum[ship_sum["Shipment Job"].isin(billed_jobs)]
 
         def options(col):
@@ -659,15 +645,16 @@ def render_billing_report():
                 return []
             return sorted(billed_ship[col].dropna().unique())
 
-        f_month = st.multiselect("Month (ETD)", all_months, placeholder="All months")
-        f_supplier = st.multiselect("Supplier", options("Supplier Name"), placeholder="All suppliers")
-        f_origin = st.multiselect("Loading port", options("Loading Port"), placeholder="All loading ports")
-        f_dest = st.multiselect("Destination port", options("Destination Port"), placeholder="All destinations")
-        f_inco = st.multiselect("Incoterms", options("Incoterms"), placeholder="All Incoterms")
-        f_mode = st.multiselect("Mode", options("Mode"), placeholder="All modes")
-        st.markdown("---")
-        st.markdown('<div class="section-title" style="color:#fff;border-color:'
-                    + ACCENT + '">Download</div>', unsafe_allow_html=True)
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            f_month = st.multiselect("Month (ETD)", all_months, placeholder="All months")
+            f_supplier = st.multiselect("Supplier", options("Supplier Name"), placeholder="All suppliers")
+        with fc2:
+            f_origin = st.multiselect("Loading port", options("Loading Port"), placeholder="All loading ports")
+            f_dest = st.multiselect("Destination port", options("Destination Port"), placeholder="All destinations")
+        with fc3:
+            f_inco = st.multiselect("Incoterms", options("Incoterms"), placeholder="All Incoterms")
+            f_mode = st.multiselect("Mode", options("Mode"), placeholder="All modes")
 
 
     def filter_df(df):
@@ -696,6 +683,18 @@ def render_billing_report():
     fdata = data[data["Shipment Job"].isin(kept)]
     fship = shipment_df[shipment_df["Shipment Job"].isin(kept)]
     supp_f = build_supplier_summary(fdata, fship) if not fdata.empty else supp_sum
+
+    # ── Download (rendered into the slot under the uploads) ───────────────────────
+
+    with download_slot:
+        st.download_button(
+            label="Download report",
+            data=create_report(ship_sum_f, bill_sum_f, bill_det_f, supp_f),
+            file_name=REPORT_FILENAME,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="br_download_top",
+        )
+        st.caption(f"{len(bill_sum_f)} shipments in the current export")
 
     # ── KPIs ──────────────────────────────────────────────────────────────────────
 
@@ -832,19 +831,11 @@ def render_billing_report():
 - **Analysis** — key metrics and spend breakdowns
         """)
 
-    with st.sidebar:
-        st.download_button(
-            label="Download report",
-            data=create_report(ship_sum_f, bill_sum_f, bill_det_f, supp_f),
-            file_name=REPORT_FILENAME,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        st.caption(f"{len(bill_sum_f)} shipments in the current export")
+
 
 
 # ── Project 2: charge by container ────────────────────────────────────────────
-# Self-contained: its own uploaders live in the tab body (not the sidebar) so
-# this project never interferes with project 1's controls.
+# Self-contained: its own uploaders, so it never interferes with project 1.
 
 def render_charge_by_container():
     st.markdown('<div class="section-title">Charge by container</div>', unsafe_allow_html=True)
@@ -941,6 +932,14 @@ def render_charge_by_container():
 
 
 # ── Projects ──────────────────────────────────────────────────────────────────
+
+session_left, session_right = st.columns([5, 1])
+with session_right:
+    if st.button("Sign out", key="sign_out"):
+        st.session_state.clear()
+        st.rerun()
+with session_left:
+    st.caption(f"Signed in as {st.session_state['auth_user']}")
 
 project_1, project_2 = st.tabs(["Billing report", "Charge by container"])
 
