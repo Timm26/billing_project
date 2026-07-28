@@ -62,27 +62,6 @@ SHIPMENT_COLUMN_MAP = {
 }
 DATE_COLS = ("ETD", "ETA", "ATD", "ATA")
 
-# ── Invoice summary (charge-by-container) config ──────────────────────────────
-# Billing-export columns the allocation reads.
-CHARGE_CODE_COL = "Charges"        # short charge code, e.g. DCART, OTHC
-CHARGE_AMOUNT_COL = "Local Amount"  # GST-exclusive amount in the base currency
-CONTAINER_LIST_COL = "Containers"   # "ABCD1234567 (40HC), EFGH7654321 (40HC)"
-
-# The export may or may not carry invoice identifiers. First match wins;
-# comparison is case-insensitive and matches on substring.
-INVOICE_NUMBER_CANDIDATES = ("invoice number", "invoice no", "invoice #",
-                             "transaction number", "commercial invoice")
-INVOICE_DATE_CANDIDATES = ("invoice date", "transaction date", "tax date")
-
-# Output headers. Change these if a downstream template expects other names.
-JOB_LABEL = "Booking Ref"
-CONTAINER_LABEL = "Container"
-COMMERCIAL_REF_LABEL = "SBFO Ref (Commercial Invoice)"
-INVOICE_NUMBER_LABEL = "Invoice Number"
-INVOICE_DATE_LABEL = "Invoice Date"
-NO_CONTAINER_LABEL = "(no container listed)"
-INVOICE_CSV_FILENAME = "charge_by_container.csv"
-
 # Theme — neutral defaults, no brand assets or brand colours.
 PRIMARY = "#33475B"
 PRIMARY_LIGHT = "#48627E"
@@ -167,12 +146,68 @@ PLOTLY_LAYOUT = dict(
 
 MAX_ATTEMPTS = 6
 
+# Tab ids used in the [access] section of the secrets file, in display order.
+TAB_BILLING = "billing"
+TAB_CONTAINER = "container"
+TAB_LABELS = {
+    TAB_BILLING: "Billing report",
+    TAB_CONTAINER: "Container breakdown",
+}
+
 
 def load_users():
+    """Username -> password hash, keyed on the lowercased username.
+
+    Usernames are matched case-insensitively, so SeaImports, seaimports and
+    SEAIMPORTS are the same account. Passwords remain case-sensitive.
+    """
     try:
-        return dict(st.secrets["users"])
+        return {str(name).strip().lower(): value
+                for name, value in dict(st.secrets["users"]).items()}
     except Exception:
         return {}
+
+
+def load_display_names():
+    """Lowercased username -> the spelling used in the secrets file."""
+    try:
+        return {str(name).strip().lower(): str(name).strip()
+                for name in dict(st.secrets["users"])}
+    except Exception:
+        return {}
+
+
+def load_access():
+    """Lowercased username -> list of tab ids that account may see.
+
+    Configured in an [access] section, one comma-separated list per user:
+
+        [access]
+        someuser = "billing"
+        another  = "billing, container"
+
+    A user with no entry sees every tab.
+    """
+    try:
+        raw = dict(st.secrets["access"])
+    except Exception:
+        return {}
+    access = {}
+    for name, value in raw.items():
+        if isinstance(value, str):
+            tabs = [part.strip().lower() for part in value.split(",") if part.strip()]
+        else:
+            tabs = [str(part).strip().lower() for part in value]
+        access[str(name).strip().lower()] = tabs
+    return access
+
+
+def allowed_tabs(username):
+    """Tab ids this account may see, in canonical order."""
+    granted = load_access().get(str(username).strip().lower())
+    if not granted:
+        return list(TAB_LABELS)
+    return [tab for tab in TAB_LABELS if tab in granted]
 
 
 def password_matches(stored, supplied):
@@ -217,9 +252,11 @@ def login_screen():
             submitted = st.form_submit_button("Sign in")
 
         if submitted:
-            stored = users.get(username.strip())
+            key = username.strip().lower()
+            stored = users.get(key)
             if stored is not None and password_matches(stored, password):
-                st.session_state["auth_user"] = username.strip()
+                st.session_state["auth_user"] = key
+                st.session_state["auth_display"] = load_display_names().get(key, key)
                 st.session_state["login_attempts"] = 0
                 st.rerun()
             st.session_state["login_attempts"] = st.session_state.get("login_attempts", 0) + 1
@@ -351,43 +388,6 @@ def add_month_col(df, ship_sum):
     return out, order
 
 
-# ── Invoice summary: charge by container ──────────────────────────────────────
-
-def find_column(df, candidates):
-    """First column whose name contains one of the candidate substrings."""
-    for candidate in candidates:
-        for col in df.columns:
-            if candidate in str(col).lower():
-                return col
-    return None
-
-
-def parse_containers(value):
-    """'ABCD1234567 (40HC), EFGH7654321 (40HC)' -> ['ABCD1234567', 'EFGH7654321']."""
-    if pd.isna(value):
-        return []
-    out = []
-    for part in str(value).replace(";", ",").split(","):
-        number = part.split("(")[0].strip()
-        if number and number.lower() != "nan":
-            out.append(number)
-    return out
-
-
-def container_map(shipment_df):
-    """Shipment job -> ordered list of container numbers."""
-    if CONTAINER_LIST_COL not in shipment_df.columns:
-        return {}
-    mapping = {}
-    for job, value in zip(shipment_df["Shipment Job"], shipment_df[CONTAINER_LIST_COL]):
-        containers = parse_containers(value)
-        if containers:
-            # Preserve order, drop repeats if a job appears on several rows.
-            existing = mapping.setdefault(job, [])
-            existing.extend(c for c in containers if c not in existing)
-    return mapping
-
-
 def split_amount(total, parts):
     """Split an amount into `parts` shares that sum back exactly to the total.
 
@@ -403,93 +403,387 @@ def split_amount(total, parts):
     return [sign * (base + (1 if i < remainder else 0)) / 100 for i in range(parts)]
 
 
-def build_charge_by_container(billing_df, shipment_df):
-    """One row per invoice + container, one column per charge code.
+# ── Project 2 helpers: per-container charge breakdown ────────────────────────
+#
+# A different client with a different shipment listing layout: the header sits
+# part-way down the sheet, the job reference column is named differently, and
+# container numbers carry their size. Nothing here is shared with project 1, so
+# changes on this side cannot affect the billing report.
 
-    Every charge line is allocated evenly across the containers on its job.
-    Returns (wide dataframe, diagnostics dict).
+CB_LOCAL_CCY = "NZD"            # currency the export's "Local" columns are in
+CB_CHARGE_CODE_COL = "Charges"
+CB_JOB_COL = "Job"
+CB_REPORT_FILENAME = "container_charge_breakdown.xlsx"
+CB_NO_CONTAINER = "(no container listed)"
+
+# A job reference is a single letter followed by digits (S04944911). Carrier
+# and B/L references carry two or three letters, so this discriminates.
+CB_JOB_PATTERN = r"^[A-Za-z]\d{6,}$"
+
+# Generic markers used to locate the header row without relying on any
+# organisation-specific column name.
+CB_HEADER_MARKERS = ("Container #", "No. of Cont.", "INCO", "Origin", "Dest.",
+                     "Pack Mode", "Consignor Name")
+
+# Source column -> internal name for the shipment listing.
+CB_SHIPMENT_MAP = {
+    "Consignor Name": "Consignor",
+    "Goods Description": "Goods",
+    "Trans": "Transport",
+    "Pack Mode": "Mode",
+    "Shipping Line": "Shipping Line",
+    "Carrier Master B/L": "Master B/L",
+    "Origin": "Origin",
+    "Dest.": "Destination",
+    "Final Discharge Port": "Discharge Port",
+    "Depart Vessel": "Vessel",
+    "Load ETD": "ETD",
+    "Final Discharge Port ETA": "ETA",
+    "Final Discharge Port ATA": "ATA",
+    "INCO": "Incoterms",
+    "No. of Cont.": "Container Count",
+    "TEU": "TEU",
+    "Container #": "Container List",
+    "Entry Ref": "Entry Ref",
+    "Import Cartage Company": "Cartage Company",
+    "Delivery Address": "Delivery Address",
+    "Weight": "Weight",
+    "Order Ref": "Order Reference",
+}
+
+CB_CONTEXT_COLS = ["Consignor", "Origin", "Destination", "Discharge Port",
+                   "Vessel", "Shipping Line", "Mode", "Incoterms", "ETD", "ETA"]
+
+
+def cb_find_header_row(raw, min_markers=3):
+    """Row index whose cells contain at least `min_markers` known headers."""
+    for i, row in raw.iterrows():
+        cells = {str(v).strip() for v in row.tolist()}
+        if sum(marker in cells for marker in CB_HEADER_MARKERS) >= min_markers:
+            return i
+    return 0
+
+
+def cb_detect_job_column(df):
+    """Column holding shipment job references, found by value shape not by name."""
+    best, best_score = None, 0
+    for col in df.columns:
+        values = df[col].dropna().astype(str).str.strip()
+        if values.empty:
+            continue
+        score = int(values.str.match(CB_JOB_PATTERN).sum())
+        if score > best_score:
+            best, best_score = col, score
+    return best
+
+
+def cb_read_shipment(file_obj):
+    """Read the client's shipment listing into normalised columns."""
+    raw = pd.read_excel(file_obj, header=None)
+    header_row = cb_find_header_row(raw)
+    file_obj.seek(0)
+    df = pd.read_excel(file_obj, header=header_row)
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+
+    job_col = cb_detect_job_column(df)
+    if job_col is None:
+        return None, None
+    df = df[df[job_col].astype(str).str.strip().str.match(CB_JOB_PATTERN)].copy()
+    df = df.rename(columns={job_col: "Job"})
+    df = df.rename(columns={k: v for k, v in CB_SHIPMENT_MAP.items() if k in df.columns})
+    df["Job"] = df["Job"].astype(str).str.strip()
+
+    for col in ("ETD", "ETA", "ATA"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    for col in ("Container Count", "TEU", "Weight"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    keep = ["Job"] + [c for c in CB_SHIPMENT_MAP.values() if c in df.columns]
+    df = df[[c for c in dict.fromkeys(keep)]]
+    return df.drop_duplicates("Job").reset_index(drop=True), job_col
+
+
+def cb_parse_containers(value):
+    """'CAAU6057065 (40HC), CMAU8473940 (40HC)' -> [(number, size), ...]."""
+    if pd.isna(value):
+        return []
+    out = []
+    for part in str(value).replace(";", ",").split(","):
+        part = part.strip()
+        if not part or part.lower() == "nan":
+            continue
+        number, _, rest = part.partition("(")
+        size = rest.split(")")[0].strip() if rest else ""
+        number = number.strip()
+        if number:
+            out.append((number, size))
+    return out
+
+
+def cb_container_table(shipment_df):
+    """One row per container, with its shipment context."""
+    rows = []
+    for _, shipment in shipment_df.iterrows():
+        containers = cb_parse_containers(shipment.get("Container List"))
+        if not containers:
+            containers = [(CB_NO_CONTAINER, "")]
+        for position, (number, size) in enumerate(containers, start=1):
+            row = {"Job": shipment["Job"], "Container": number,
+                   "Container Size": size, "Position": position}
+            for col in CB_CONTEXT_COLS:
+                if col in shipment_df.columns:
+                    row[col] = shipment.get(col)
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def cb_build_charge_detail(billing_df, shipment_df):
+    """Explode every charge line across the containers on its job.
+
+    Returns (detail, diagnostics). Each charge line's amounts are split evenly
+    across the job's containers in whole cents, so the parts add back exactly.
     """
-    diagnostics = {"missing_columns": [], "jobs_without_containers": [],
-                   "invoice_number_source": None, "invoice_date_source": None}
-
-    for col in (CHARGE_CODE_COL, CHARGE_AMOUNT_COL, BILLING_JOB_COL):
+    diagnostics = {"missing_columns": [], "unmatched_jobs": [],
+                   "jobs_without_containers": []}
+    for col in (CB_CHARGE_CODE_COL, CB_JOB_COL, "Local Amount"):
         if col not in billing_df.columns:
             diagnostics["missing_columns"].append(col)
     if diagnostics["missing_columns"]:
         return pd.DataFrame(), diagnostics
 
-    invoice_no_col = find_column(billing_df, INVOICE_NUMBER_CANDIDATES)
-    invoice_date_col = find_column(billing_df, INVOICE_DATE_CANDIDATES)
-    diagnostics["invoice_number_source"] = invoice_no_col
-    diagnostics["invoice_date_source"] = invoice_date_col
+    containers = cb_container_table(shipment_df)
+    by_job = {job: group for job, group in containers.groupby("Job")}
 
-    containers_by_job = container_map(shipment_df)
+    numeric_cols = [c for c in ("Amount", "Tax", "Total", "Local Amount", "Local Total")
+                    if c in billing_df.columns]
 
-    work = billing_df.copy()
-    work["_job"] = work[BILLING_JOB_COL].astype(str).str.strip()
-    work["_code"] = work[CHARGE_CODE_COL].astype(str).str.strip().str.upper()
-    work["_amount"] = pd.to_numeric(work[CHARGE_AMOUNT_COL], errors="coerce").fillna(0.0)
-    work["_invoice"] = (work[invoice_no_col].astype(str).str.strip()
-                        if invoice_no_col else "")
-    if invoice_date_col:
-        work["_invoice_date"] = pd.to_datetime(work[invoice_date_col], errors="coerce")
-    else:
-        work["_invoice_date"] = pd.NaT
-    work = work[work["_amount"] != 0]
+    records = []
+    for line in billing_df.to_dict("records"):
+        job = str(line[CB_JOB_COL]).strip()
+        group = by_job.get(job)
+        if group is None:
+            if job not in diagnostics["unmatched_jobs"]:
+                diagnostics["unmatched_jobs"].append(job)
+            continue
+        if list(group["Container"]) == [CB_NO_CONTAINER]:
+            if job not in diagnostics["jobs_without_containers"]:
+                diagnostics["jobs_without_containers"].append(job)
 
-    # One figure per invoice + job + charge code before allocating.
-    grouped = (work.groupby(["_invoice", "_job", "_code"], dropna=False)
-               .agg(amount=("_amount", "sum"), invoice_date=("_invoice_date", "max"))
-               .reset_index()
-               .rename(columns={"_invoice": "invoice", "_job": "job", "_code": "code"}))
+        parts = len(group)
+        shares = {col: split_amount(pd.to_numeric(line.get(col), errors="coerce") or 0.0, parts)
+                  for col in numeric_cols}
 
-    records = {}
-    for row in grouped.itertuples(index=False):
-        containers = containers_by_job.get(row.job) or containers_by_job.get(row.job.upper())
-        if not containers:
-            containers = [NO_CONTAINER_LABEL]
-            if row.job not in diagnostics["jobs_without_containers"]:
-                diagnostics["jobs_without_containers"].append(row.job)
-        for container, share in zip(containers, split_amount(row.amount, len(containers))):
-            key = (row.invoice, row.job, container, row.invoice_date)
-            record = records.setdefault(key, {})
-            record[row.code] = round(record.get(row.code, 0.0) + share, 2)
+        for i, (_, container) in enumerate(group.iterrows()):
+            record = {
+                "Job": job,
+                "Container": container["Container"],
+                "Container Size": container["Container Size"],
+                "Charge Code": str(line[CB_CHARGE_CODE_COL]).strip().upper(),
+                "Description": line.get("Description"),
+                "Currency": line.get("Currency"),
+                "Containers on Job": parts,
+            }
+            for col in CB_CONTEXT_COLS:
+                if col in container.index:
+                    record[col] = container[col]
+            record["Line Total (ex tax)"] = pd.to_numeric(
+                line.get("Local Amount"), errors="coerce")
+            for col in numeric_cols:
+                record[f"Allocated {col}"] = shares[col][i]
+            if "Tax Date" in line:
+                record["Charge Date"] = pd.to_datetime(line["Tax Date"], errors="coerce")
+            records.append(record)
 
     if not records:
         return pd.DataFrame(), diagnostics
 
-    rows = []
-    for (invoice, job, container, invoice_date), charges in records.items():
-        row = {JOB_LABEL: job, CONTAINER_LABEL: container,
-               COMMERCIAL_REF_LABEL: invoice, INVOICE_NUMBER_LABEL: invoice,
-               INVOICE_DATE_LABEL: (invoice_date.strftime("%d/%m/%Y")
-                                    if pd.notna(invoice_date) else "")}
-        row.update(charges)
-        rows.append(row)
-
-    wide = pd.DataFrame(rows)
-    code_cols = sorted(c for c in wide.columns if c not in (
-        JOB_LABEL, CONTAINER_LABEL, COMMERCIAL_REF_LABEL,
-        INVOICE_NUMBER_LABEL, INVOICE_DATE_LABEL))
-    wide["TOTAL"] = wide[code_cols].sum(axis=1).round(2)
-    wide = wide[[JOB_LABEL, CONTAINER_LABEL, COMMERCIAL_REF_LABEL, *code_cols,
-                 "TOTAL", INVOICE_NUMBER_LABEL, INVOICE_DATE_LABEL]]
-    return (wide.sort_values([INVOICE_NUMBER_LABEL, JOB_LABEL, CONTAINER_LABEL])
+    detail = pd.DataFrame(records)
+    ordered = ["Job", "Container", "Container Size", "Charge Code", "Description",
+               "Currency", "Containers on Job", "Line Total (ex tax)"]
+    allocated = [c for c in detail.columns if c.startswith("Allocated")]
+    context = [c for c in CB_CONTEXT_COLS if c in detail.columns]
+    tail = [c for c in ("Charge Date",) if c in detail.columns]
+    detail = detail[ordered + allocated + context + tail]
+    return (detail.sort_values(["Job", "Container", "Charge Code"])
             .reset_index(drop=True), diagnostics)
 
 
-def reorder_to_template(wide, template_columns):
-    """Match a template's column order. Columns the template doesn't mention —
-    charge codes new since the template was made — keep their place at the end
-    rather than being dropped."""
-    tail = [c for c in ("TOTAL", INVOICE_NUMBER_LABEL, INVOICE_DATE_LABEL)
-            if c in wide.columns]
-    ordered = []
-    for col in template_columns:
-        if col in wide.columns and col not in ordered and col not in tail:
-            ordered.append(col)
-    extras = [col for col in wide.columns if col not in ordered and col not in tail]
-    return wide.reindex(columns=ordered + extras + tail)
+CB_ALLOC_EX = "Allocated Local Amount"
+CB_ALLOC_TAX = "Allocated Local Tax"
+CB_ALLOC_INC = "Allocated Local Total"
+
+
+def cb_container_matrix(detail):
+    """Containers down the side, charge codes across the top."""
+    matrix = detail.pivot_table(
+        index=["Job", "Container", "Container Size"],
+        columns="Charge Code", values=CB_ALLOC_EX,
+        aggfunc="sum", observed=True).reset_index()
+    matrix.columns.name = None
+    codes = [c for c in matrix.columns if c not in ("Job", "Container", "Container Size")]
+    matrix["TOTAL"] = matrix[codes].sum(axis=1).round(2)
+    return matrix
+
+
+def cb_container_summary(detail):
+    summary = detail.groupby(["Job", "Container", "Container Size"], observed=True).agg(
+        Charge_Lines=("Charge Code", "count"),
+        Charge_Codes=("Charge Code", "nunique"),
+        Total_ex_Tax=(CB_ALLOC_EX, "sum"),
+        Total_inc_Tax=(CB_ALLOC_INC, "sum"),
+    ).reset_index()
+    context = detail.drop_duplicates(["Job", "Container"])[
+        ["Job", "Container"] + [c for c in CB_CONTEXT_COLS if c in detail.columns]]
+    summary = pd.merge(summary, context, how="left", on=["Job", "Container"])
+    for col in ("Total_ex_Tax", "Total_inc_Tax"):
+        summary[col] = summary[col].round(2)
+    return summary.sort_values("Total_ex_Tax", ascending=False).reset_index(drop=True)
+
+
+def cb_shipment_summary(detail, shipment_df):
+    summary = detail.groupby("Job", observed=True).agg(
+        Containers=("Container", "nunique"),
+        Charge_Lines=("Charge Code", "count"),
+        Total_ex_Tax=(CB_ALLOC_EX, "sum"),
+        Total_inc_Tax=(CB_ALLOC_INC, "sum"),
+    ).reset_index()
+    summary["Cost_per_Container"] = (
+        summary["Total_ex_Tax"] / summary["Containers"].replace(0, pd.NA)).round(2)
+    context_cols = ["Job"] + [c for c in
+                              ["Consignor", "Origin", "Destination", "Discharge Port",
+                               "Vessel", "Shipping Line", "Mode", "Incoterms",
+                               "Container Count", "TEU", "ETD", "ETA", "ATA",
+                               "Entry Ref", "Order Reference"]
+                              if c in shipment_df.columns]
+    summary = pd.merge(summary, shipment_df[context_cols], how="left", on="Job")
+    for col in ("Total_ex_Tax", "Total_inc_Tax"):
+        summary[col] = summary[col].round(2)
+    return summary.sort_values("Total_ex_Tax", ascending=False).reset_index(drop=True)
+
+
+def cb_charge_code_summary(detail):
+    summary = detail.groupby("Charge Code", observed=True).agg(
+        Shipments=("Job", "nunique"),
+        Containers=("Container", "nunique"),
+        Charge_Lines=("Charge Code", "count"),
+        Total_ex_Tax=(CB_ALLOC_EX, "sum"),
+    ).reset_index()
+    summary["Avg_per_Container"] = (
+        summary["Total_ex_Tax"] / summary["Containers"].replace(0, pd.NA)).round(2)
+    summary["Share_of_Spend_%"] = (
+        100 * summary["Total_ex_Tax"] / summary["Total_ex_Tax"].sum()).round(2)
+    summary["Total_ex_Tax"] = summary["Total_ex_Tax"].round(2)
+    return summary.sort_values("Total_ex_Tax", ascending=False).reset_index(drop=True)
+
+
+def cb_consignor_summary(detail):
+    if "Consignor" not in detail.columns:
+        return pd.DataFrame()
+    summary = detail.groupby("Consignor", observed=True).agg(
+        Shipments=("Job", "nunique"),
+        Containers=("Container", "nunique"),
+        Total_ex_Tax=(CB_ALLOC_EX, "sum"),
+    ).reset_index()
+    summary["Avg_per_Container"] = (
+        summary["Total_ex_Tax"] / summary["Containers"].replace(0, pd.NA)).round(2)
+    summary["Total_ex_Tax"] = summary["Total_ex_Tax"].round(2)
+    return summary.sort_values("Total_ex_Tax", ascending=False).reset_index(drop=True)
+
+
+def cb_lane_summary(detail):
+    keys = [c for c in ("Origin", "Destination") if c in detail.columns]
+    if not keys:
+        return pd.DataFrame()
+    summary = detail.groupby(keys, observed=True).agg(
+        Shipments=("Job", "nunique"),
+        Containers=("Container", "nunique"),
+        Total_ex_Tax=(CB_ALLOC_EX, "sum"),
+    ).reset_index()
+    summary["Avg_per_Container"] = (
+        summary["Total_ex_Tax"] / summary["Containers"].replace(0, pd.NA)).round(2)
+    summary["Total_ex_Tax"] = summary["Total_ex_Tax"].round(2)
+    return summary.sort_values("Total_ex_Tax", ascending=False).reset_index(drop=True)
+
+
+def cb_monthly_summary(detail):
+    if "ETD" not in detail.columns:
+        return pd.DataFrame()
+    work = detail.copy()
+    work["_etd"] = pd.to_datetime(work["ETD"], errors="coerce")
+    work = work[work["_etd"].notna()]
+    if work.empty:
+        return pd.DataFrame()
+    work["_sort"] = work["_etd"].dt.to_period("M").dt.to_timestamp()
+    work["Month"] = work["_etd"].dt.strftime("%b %Y")
+    summary = work.groupby(["_sort", "Month"], observed=True).agg(
+        Shipments=("Job", "nunique"),
+        Containers=("Container", "nunique"),
+        Total_ex_Tax=(CB_ALLOC_EX, "sum"),
+    ).reset_index().sort_values("_sort").drop(columns="_sort")
+    summary["Avg_per_Container"] = (
+        summary["Total_ex_Tax"] / summary["Containers"].replace(0, pd.NA)).round(2)
+    summary["Total_ex_Tax"] = summary["Total_ex_Tax"].round(2)
+    return summary.reset_index(drop=True)
+
+
+def cb_kpis(detail, shipment_df, unmatched_total=0.0):
+    return pd.DataFrame([
+        {"Metric": "Shipments billed", "Value": detail["Job"].nunique()},
+        {"Metric": "Shipments in listing", "Value": len(shipment_df)},
+        {"Metric": "Containers", "Value": detail["Container"].nunique()},
+        {"Metric": "Charge lines allocated", "Value": len(detail)},
+        {"Metric": "Charge codes", "Value": detail["Charge Code"].nunique()},
+        {"Metric": f"Total ex tax ({CB_LOCAL_CCY})", "Value": round(detail[CB_ALLOC_EX].sum(), 2)},
+        {"Metric": f"Total inc tax ({CB_LOCAL_CCY})", "Value": round(detail[CB_ALLOC_INC].sum(), 2)},
+        {"Metric": f"Average per container ({CB_LOCAL_CCY})",
+         "Value": (round(detail[CB_ALLOC_EX].sum() / detail["Container"].nunique(), 2)
+                   if detail["Container"].nunique() else 0)},
+        {"Metric": f"Unmatched charges excluded ({CB_LOCAL_CCY})", "Value": round(unmatched_total, 2)},
+    ])
+
+
+def cb_write_sheet(writer, name, df, number_format="#,##0.00"):
+    """Write a sheet with a styled header row and sensible column widths."""
+    if df is None or df.empty:
+        return
+    df.to_excel(writer, sheet_name=name[:31], index=False)
+    ws = writer.sheets[name[:31]]
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF", size=11)
+        cell.fill = PatternFill("solid", start_color=PRIMARY.lstrip("#"))
+    ws.freeze_panes = "A2"
+    for column in ws.columns:
+        letter = column[0].column_letter
+        longest = max((len(str(c.value)) for c in column[:200] if c.value is not None),
+                      default=10)
+        ws.column_dimensions[letter].width = min(max(longest + 2, 10), 46)
+        for cell in column[1:]:
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = number_format
+
+
+def cb_create_report(detail, shipment_df, unmatched):
+    """Multi-sheet workbook: detail plus one sheet per summary view."""
+    buf = io.BytesIO()
+    unmatched_total = (pd.to_numeric(unmatched["Local Amount"], errors="coerce").fillna(0).sum()
+                       if unmatched is not None and not unmatched.empty else 0.0)
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        cb_write_sheet(writer, "KPIs", cb_kpis(detail, shipment_df, unmatched_total))
+        cb_write_sheet(writer, "Charge Detail", detail)
+        cb_write_sheet(writer, "Container Matrix", cb_container_matrix(detail))
+        cb_write_sheet(writer, "Container Summary", cb_container_summary(detail))
+        cb_write_sheet(writer, "Shipment Summary", cb_shipment_summary(detail, shipment_df))
+        cb_write_sheet(writer, "Charge Code Summary", cb_charge_code_summary(detail))
+        cb_write_sheet(writer, "Consignor Summary", cb_consignor_summary(detail))
+        cb_write_sheet(writer, "Lane Summary", cb_lane_summary(detail))
+        cb_write_sheet(writer, "Monthly Summary", cb_monthly_summary(detail))
+        if unmatched is not None and not unmatched.empty:
+            cb_write_sheet(writer, "Unmatched Charges", unmatched)
+    buf.seek(0)
+    return buf
 
 
 # ── Excel report ──────────────────────────────────────────────────────────────
@@ -834,101 +1128,142 @@ def render_billing_report():
 
 
 
-# ── Project 2: charge by container ────────────────────────────────────────────
+# ── Project 2: per-container charge breakdown ─────────────────────────────────
 # Self-contained: its own uploaders, so it never interferes with project 1.
 
-def render_charge_by_container():
-    st.markdown('<div class="section-title">Charge by container</div>', unsafe_allow_html=True)
+def render_container_breakdown():
+    st.markdown('<div class="section-title">Charge breakdown by container</div>',
+                unsafe_allow_html=True)
     st.caption(
-        "Allocates every charge line evenly across the containers on its job and "
-        "pivots the result to one row per invoice and container, one column per "
-        f"charge code. Amounts are GST-exclusive, in {BASE_CCY}, and each charge's "
-        "shares add back to the invoiced figure to the cent."
+        "Every charge line on the billing export, broken out against each container "
+        "on its shipment. Amounts are split evenly across the job's containers in "
+        "whole cents, so the parts always add back to the invoiced figure."
     )
 
-    left, right = st.columns(2)
-    with left:
+    st.markdown('<div class="section-title">Upload files</div>', unsafe_allow_html=True)
+    up_left, up_right = st.columns(2)
+    with up_left:
         billing_files = st.file_uploader(
             "Billing export(s)", type=["xlsx", "csv"],
-            accept_multiple_files=True, key="cbc_billing")
-    with right:
+            accept_multiple_files=True, key="cb_billing")
+    with up_right:
         shipment_file = st.file_uploader(
-            "Shipment listing report", type=["xlsx", "csv"], key="cbc_shipment")
+            "Shipment listing report", type=["xlsx", "csv"], key="cb_shipment")
 
     if not billing_files or not shipment_file:
-        st.info("Upload the billing export(s) and the shipment listing report to build "
-                "the allocation. The container numbers come from the shipment report.")
+        st.info("Upload the billing export(s) and the shipment listing report to begin.")
         return
 
-    with st.spinner("Allocating charges…"):
-        sheets = [read_billing(f) for f in billing_files]
-        sheets = [s for s in sheets if s is not None]
-        shipment = read_shipment(shipment_file)
-    if not sheets or shipment is None:
-        st.error("The files could not be read.")
-        return
+    download_slot = st.container()
 
-    billing = pd.concat(sheets, ignore_index=True)
-    cbc, diag = build_charge_by_container(billing, shipment)
+    with st.spinner("Allocating charges across containers…"):
+        sheets = []
+        for uploaded in billing_files:
+            try:
+                sheets.append(pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv")
+                              else pd.read_excel(uploaded))
+            except Exception as e:
+                st.error(f"Could not read {uploaded.name}: {e}")
+        if not sheets:
+            return
+        billing = pd.concat(sheets, ignore_index=True)
+        billing.columns = [str(c).strip() for c in billing.columns]
+
+        try:
+            shipment_df, job_col = cb_read_shipment(shipment_file)
+        except Exception as e:
+            st.error(f"Could not read the shipment listing: {e}")
+            return
+        if shipment_df is None or shipment_df.empty:
+            st.error("No shipment rows were found. Check that the listing contains a "
+                     "job reference column and container numbers.")
+            return
+
+        detail, diag = cb_build_charge_detail(billing, shipment_df)
 
     if diag["missing_columns"]:
         st.error("The billing export is missing: " + ", ".join(diag["missing_columns"]))
         return
-    if cbc.empty:
-        st.warning("No non-zero charge lines found to allocate.")
+    if detail.empty:
+        st.warning("No charge lines could be matched to a shipment in the listing.")
         return
 
-    if diag["invoice_number_source"]:
-        st.caption(f"Invoice number read from the '{diag['invoice_number_source']}' column.")
-    else:
+    unmatched = billing[billing[CB_JOB_COL].astype(str).str.strip()
+                        .isin(diag["unmatched_jobs"])] if diag["unmatched_jobs"] else pd.DataFrame()
+
+    st.caption(f"Shipment listing read from {len(shipment_df)} shipments "
+               f"(job reference column: '{job_col}').")
+
+    total_ex = detail[CB_ALLOC_EX].sum()
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Shipments", f"{detail['Job'].nunique():,}")
+    k2.metric("Containers", f"{detail['Container'].nunique():,}")
+    k3.metric("Charge lines", f"{len(detail):,}")
+    k4.metric(f"Total ex tax ({CB_LOCAL_CCY})", f"{total_ex:,.2f}")
+
+    if diag["unmatched_jobs"]:
         st.warning(
-            "No invoice number column was found in the billing export, so rows are "
-            "grouped by charge date and the invoice columns are left blank. Add the "
-            "invoice number to the export and it will be picked up automatically."
+            f"{len(diag['unmatched_jobs'])} job(s) on the billing export are not in the "
+            "shipment listing, so their charges are excluded from the breakdown. They are "
+            "listed on the 'Unmatched Charges' sheet of the download."
         )
     if diag["jobs_without_containers"]:
         st.info(
-            f"{len(diag['jobs_without_containers'])} job(s) have no container listed in "
-            f"the shipment report; their charges sit on a '{NO_CONTAINER_LABEL}' row so "
-            "nothing is dropped from the totals."
+            f"{len(diag['jobs_without_containers'])} shipment(s) have no container number, "
+            f"so their charges sit against a '{CB_NO_CONTAINER}' row rather than being dropped."
         )
 
-    template = st.file_uploader(
-        "Optional: upload an existing report to copy its column order",
-        type=["csv"], key="cbc_template")
-    if template is not None:
-        try:
-            cbc = reorder_to_template(cbc, list(pd.read_csv(template, nrows=0).columns))
-        except Exception as e:
-            st.error(f"Could not read the template header: {e}")
+    view = st.radio("View", ["Charge detail", "Container matrix", "Per container",
+                             "Per charge code", "Per shipment"],
+                    horizontal=True, key="cb_view", label_visibility="collapsed")
 
-    meta_cols = (JOB_LABEL, CONTAINER_LABEL, COMMERCIAL_REF_LABEL,
-                 INVOICE_NUMBER_LABEL, INVOICE_DATE_LABEL, "TOTAL")
-    code_count = len([c for c in cbc.columns if c not in meta_cols])
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Rows", f"{len(cbc):,}")
-    m2.metric("Containers", f"{cbc[CONTAINER_LABEL].nunique():,}")
-    m3.metric("Charge codes", f"{code_count:,}")
-    m4.metric(f"Allocated ({BASE_CCY})", f"{cbc['TOTAL'].sum():,.2f}")
-
-    st.dataframe(cbc, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        label="Download charge by container (CSV)",
-        data=cbc.to_csv(index=False).encode("utf-8"),
-        file_name=INVOICE_CSV_FILENAME,
-        mime="text/csv",
-    )
-
-    source_total = pd.to_numeric(billing[CHARGE_AMOUNT_COL], errors="coerce").fillna(0).sum()
-    difference = round(cbc["TOTAL"].sum() - source_total, 2)
-    if abs(difference) < 0.01:
-        st.success(f"Reconciled: the allocation matches the billing export "
-                   f"({source_total:,.2f} {BASE_CCY}).")
+    if view == "Charge detail":
+        st.dataframe(detail, use_container_width=True, hide_index=True)
+        st.caption(f"{len(detail):,} allocated charge lines")
+    elif view == "Container matrix":
+        matrix = cb_container_matrix(detail)
+        st.dataframe(matrix, use_container_width=True, hide_index=True)
+        st.caption(f"{len(matrix):,} containers × "
+                   f"{detail['Charge Code'].nunique()} charge codes")
+    elif view == "Per container":
+        st.dataframe(cb_container_summary(detail), use_container_width=True, hide_index=True)
+    elif view == "Per charge code":
+        code_summary = cb_charge_code_summary(detail)
+        st.dataframe(code_summary, use_container_width=True, hide_index=True)
+        fig = px.bar(code_summary.sort_values("Total_ex_Tax").tail(15),
+                     x="Total_ex_Tax", y="Charge Code", orientation="h",
+                     color_discrete_sequence=[PRIMARY],
+                     labels={"Total_ex_Tax": f"Total ex tax ({CB_LOCAL_CCY})",
+                             "Charge Code": ""})
+        fig.update_layout(**PLOTLY_LAYOUT, xaxis_title="", yaxis_title="")
+        fig.update_traces(marker_line_width=0)
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        st.error(f"The allocation is out by {difference:,.2f} {BASE_CCY} against the "
-                 f"billing export ({source_total:,.2f}).")
+        st.dataframe(cb_shipment_summary(detail, shipment_df),
+                     use_container_width=True, hide_index=True)
+
+    with download_slot:
+        st.download_button(
+            label="Download Excel breakdown",
+            data=cb_create_report(detail, shipment_df, unmatched),
+            file_name=CB_REPORT_FILENAME,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="cb_download",
+        )
+        st.caption(f"{detail['Container'].nunique():,} containers · "
+                   f"{CB_LOCAL_CCY} {total_ex:,.2f} ex tax · 9 sheets")
+
+    source_total = pd.to_numeric(billing["Local Amount"], errors="coerce").fillna(0).sum()
+    unmatched_total = (pd.to_numeric(unmatched["Local Amount"], errors="coerce").fillna(0).sum()
+                       if not unmatched.empty else 0.0)
+    difference = round(total_ex + unmatched_total - source_total, 2)
+    if abs(difference) < 0.01:
+        st.success(f"Reconciled: allocated {CB_LOCAL_CCY} {total_ex:,.2f} plus "
+                   f"{CB_LOCAL_CCY} {unmatched_total:,.2f} unmatched equals the export's "
+                   f"{CB_LOCAL_CCY} {source_total:,.2f}.")
+    else:
+        st.error(f"Out by {CB_LOCAL_CCY} {difference:,.2f} against the export's "
+                 f"{CB_LOCAL_CCY} {source_total:,.2f}.")
 
 
 # ── Projects ──────────────────────────────────────────────────────────────────
@@ -941,10 +1276,10 @@ with session_right:
 with session_left:
     st.caption(f"Signed in as {st.session_state['auth_user']}")
 
-project_1, project_2 = st.tabs(["Billing report", "Charge by container"])
+project_1, project_2 = st.tabs(["Billing report", "Container breakdown"])
 
 with project_1:
     render_billing_report()
 
 with project_2:
-    render_charge_by_container()
+    render_container_breakdown()
