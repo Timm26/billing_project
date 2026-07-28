@@ -1274,12 +1274,21 @@ with session_right:
         st.session_state.clear()
         st.rerun()
 with session_left:
-    st.caption(f"Signed in as {st.session_state['auth_user']}")
+    st.caption(f"Signed in as {st.session_state.get('auth_display', st.session_state['auth_user'])}")
 
-project_1, project_2 = st.tabs(["Billing report", "Container breakdown"])
+# Only the tabs this account is granted. Content for a tab the user cannot see
+# is never rendered, so it is not sent to the browser at all.
+granted = allowed_tabs(st.session_state["auth_user"])
 
-with project_1:
-    render_billing_report()
+if not granted:
+    st.error("This account has no reports assigned. Contact the report owner.")
+    st.stop()
 
-with project_2:
-    render_container_breakdown()
+renderers = {
+    TAB_BILLING: render_billing_report,
+    TAB_CONTAINER: render_container_breakdown,
+}
+
+for tab, container in zip(granted, st.tabs([TAB_LABELS[t] for t in granted])):
+    with container:
+        renderers[tab]()
