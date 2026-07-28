@@ -745,12 +745,22 @@ def cb_kpis(detail, shipment_df, unmatched_total=0.0):
     ])
 
 
-def cb_write_sheet(writer, name, df, number_format="#,##0.00"):
-    """Write a sheet with a styled header row and sensible column widths."""
+CB_BAND_FILL = "F1F5F9"  # very light tint used to separate groups of rows
+
+
+def cb_write_sheet(writer, name, df, number_format="#,##0.00", band_by=None):
+    """Write a sheet with a styled header row and sensible column widths.
+
+    band_by: optional list of columns whose combined value defines a group. The
+    background alternates between plain and a very light tint each time that
+    value changes, so consecutive rows belonging to one container (or one job)
+    read as a single block.
+    """
     if df is None or df.empty:
         return
-    df.to_excel(writer, sheet_name=name[:31], index=False)
-    ws = writer.sheets[name[:31]]
+    sheet = name[:31]
+    df.to_excel(writer, sheet_name=sheet, index=False)
+    ws = writer.sheets[sheet]
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF", size=11)
         cell.fill = PatternFill("solid", start_color=PRIMARY.lstrip("#"))
@@ -764,6 +774,22 @@ def cb_write_sheet(writer, name, df, number_format="#,##0.00"):
             if isinstance(cell.value, (int, float)):
                 cell.number_format = number_format
 
+    if band_by:
+        keys = [c for c in band_by if c in df.columns]
+        if not keys:
+            return
+        band = PatternFill("solid", start_color=CB_BAND_FILL)
+        shaded = False
+        previous = None
+        for offset, group in enumerate(df[keys].astype(str).agg("|".join, axis=1)):
+            if previous is not None and group != previous:
+                shaded = not shaded
+            previous = group
+            if shaded:
+                for cell in ws[offset + 2]:
+                    cell.fill = band
+    return
+
 
 def cb_create_report(detail, shipment_df, unmatched):
     """Multi-sheet workbook: detail plus one sheet per summary view."""
@@ -772,8 +798,10 @@ def cb_create_report(detail, shipment_df, unmatched):
                        if unmatched is not None and not unmatched.empty else 0.0)
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         cb_write_sheet(writer, "KPIs", cb_kpis(detail, shipment_df, unmatched_total))
-        cb_write_sheet(writer, "Charge Detail", detail)
-        cb_write_sheet(writer, "Container Matrix", cb_container_matrix(detail))
+        cb_write_sheet(writer, "Charge Detail", detail,
+                       band_by=["Job", "Container"])
+        cb_write_sheet(writer, "Container Matrix", cb_container_matrix(detail),
+                       band_by=["Job"])
         cb_write_sheet(writer, "Container Summary", cb_container_summary(detail))
         cb_write_sheet(writer, "Shipment Summary", cb_shipment_summary(detail, shipment_df))
         cb_write_sheet(writer, "Charge Code Summary", cb_charge_code_summary(detail))
