@@ -100,25 +100,104 @@ st.set_page_config(
 CSS = Template("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* Keep native controls light even when the viewer's browser is in dark mode.
+   The theme itself is forced light in .streamlit/config.toml; everything below
+   restates the colours explicitly so the app stays readable if that file is
+   missing or a viewer overrides it. */
+:root { color-scheme: light; }
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .stApp { background-color: $bg; color: $text; }
-.stMultiSelect [data-baseweb="tag"] { background-color: $accent !important; color: #ffffff !important; }
+.stApp p, .stApp li, .stApp span, .stApp label { color: $text; }
+
+/* ── Header ── */
 .app-header { background: linear-gradient(90deg,$primary 0%,$primary_light 100%); border-bottom:4px solid $accent; padding:20px 32px; margin:-1rem -1rem 2rem -1rem; display:flex; align-items:center; gap:20px; }
-.app-header h1 { font-size:1.7rem; font-weight:700; color:#fff; margin:0; letter-spacing:.01em; }
-.app-subtitle { font-size:.78rem; color:#c8d6e5; letter-spacing:.08em; text-transform:uppercase; margin-top:4px; }
+.app-header h1 { font-size:1.7rem; font-weight:700; color:#fff !important; margin:0; letter-spacing:.01em; }
+.app-subtitle { font-size:.78rem; color:#c8d6e5 !important; letter-spacing:.08em; text-transform:uppercase; margin-top:4px; }
 .section-title { font-size:.95rem; font-weight:600; color:$primary; text-transform:uppercase; letter-spacing:.08em; border-left:4px solid $accent; padding-left:10px; margin:20px 0 10px 0; }
+
+/* ── Widget labels (Username, Password, uploader and filter labels) ── */
+[data-testid="stWidgetLabel"], [data-testid="stWidgetLabel"] p,
+[data-testid="stWidgetLabel"] label, .stTextInput label, .stFileUploader label,
+.stMultiSelect label, .stRadio label, .stSelectbox label {
+  color: $text !important; font-weight: 600 !important; font-size: .9rem !important;
+}
+
+/* ── Text and password inputs ── */
+[data-baseweb="input"], [data-baseweb="base-input"],
+.stTextInput input, .stTextInput > div > div {
+  background-color: $surface !important; color: $text !important;
+  border-color: $border !important;
+}
+[data-baseweb="input"] { border: 1px solid $border !important; border-radius: 6px !important; }
+[data-baseweb="input"]:focus-within { border-color: $accent !important; box-shadow: 0 0 0 2px rgba(14,128,116,.18) !important; }
+.stTextInput input { -webkit-text-fill-color: $text !important; caret-color: $text; }
+.stTextInput input::placeholder { color: $muted !important; -webkit-text-fill-color: $muted !important; }
+.stTextInput button svg, [data-baseweb="input"] svg { fill: $muted !important; color: $muted !important; }
+
+/* ── Buttons: regular, download and form submit (Sign in) ── */
+.stDownloadButton button, .stButton button, .stFormSubmitButton button,
+[data-testid="stFormSubmitButton"] button, [data-testid="stBaseButton-secondaryFormSubmit"] {
+  background-color:$accent !important; color:#fff !important; font-weight:600 !important;
+  letter-spacing:.06em !important; text-transform:uppercase !important; border:none !important;
+  border-radius:4px !important; padding:10px 28px !important;
+}
+.stDownloadButton button p, .stButton button p, .stFormSubmitButton button p,
+[data-testid="stFormSubmitButton"] button p { color:#fff !important; }
+.stDownloadButton button:hover, .stButton button:hover, .stFormSubmitButton button:hover,
+[data-testid="stFormSubmitButton"] button:hover { background-color:$accent_dark !important; }
+
+/* ── Sign-in card ── */
+[data-testid="stForm"] {
+  background-color:$surface !important; border:1px solid $border !important;
+  border-radius:8px !important; padding:24px 28px !important;
+  box-shadow:0 2px 12px rgba(27,42,56,.08);
+}
+.login-title { font-size:1.15rem; font-weight:700; color:$primary; margin:0 0 4px 0; }
+.login-hint { font-size:.85rem; color:$muted; margin:0 0 12px 0; }
+
+/* ── Tabs ── */
+.stTabs [data-baseweb="tab-list"] { background-color:$surface; border-bottom:2px solid $border; gap:0; border-radius:6px 6px 0 0; }
+.stTabs [data-baseweb="tab"] { font-weight:600; font-size:.85rem; letter-spacing:.04em; text-transform:uppercase; background:transparent !important; border:none !important; padding:12px 24px; }
+.stTabs [data-baseweb="tab"], .stTabs [data-baseweb="tab"] p { color:$muted !important; }
+.stTabs [data-baseweb="tab"]:hover p { color:$primary !important; }
+.stTabs [aria-selected="true"], .stTabs [aria-selected="true"] p { color:$primary !important; }
+.stTabs [data-baseweb="tab-highlight"] { background-color:$accent !important; height:3px !important; }
+.stTabs [data-baseweb="tab-border"] { background-color:$border !important; }
+
+/* ── File uploader ── */
+[data-testid="stFileUploader"] { background-color:$surface; border:2px dashed $border; border-radius:6px; padding:10px 12px; }
+[data-testid="stFileUploaderDropzone"], section[data-testid="stFileUploaderDropzone"] {
+  background-color:#F7FAFC !important; border:1px solid $border !important; border-radius:6px !important;
+}
+[data-testid="stFileUploaderDropzone"] *, [data-testid="stFileUploaderDropzoneInstructions"] *,
+[data-testid="stFileUploaderFile"] *, [data-testid="stFileUploaderFileName"] { color:$text !important; }
+[data-testid="stFileUploaderDropzone"] small { color:$muted !important; }
+[data-testid="stFileUploaderDropzone"] button, [data-testid="stBaseButton-secondary"] {
+  background-color:$accent !important; color:#fff !important; border:none !important;
+}
+[data-testid="stFileUploaderDropzone"] button *, [data-testid="stBaseButton-secondary"] * { color:#fff !important; fill:#fff !important; }
+
+/* ── Multiselect, select, radio, expander ── */
+[data-baseweb="select"] > div { background-color:$surface !important; border-color:$border !important; color:$text !important; }
+[data-baseweb="select"] input { color:$text !important; -webkit-text-fill-color:$text !important; }
+[data-baseweb="popover"] li, [data-baseweb="menu"] li { background-color:$surface !important; color:$text !important; }
+.stMultiSelect [data-baseweb="tag"] { background-color:$accent !important; color:#ffffff !important; }
+.stMultiSelect [data-baseweb="tag"] span { color:#ffffff !important; }
+.stRadio [role="radiogroup"] label p { color:$text !important; font-weight:500; }
+[data-testid="stExpander"] { background-color:$surface; border:1px solid $border; border-radius:6px; }
+[data-testid="stExpander"] summary, [data-testid="stExpander"] summary p { color:$text !important; font-weight:600; }
+
+/* ── Tables, metrics, captions, alerts ── */
 [data-testid="stDataFrame"] { border:1px solid $border; border-radius:6px; background-color:$surface; }
-.stTabs [data-baseweb="tab-list"] { background-color:$surface; border-bottom:2px solid $border; gap:0; }
-.stTabs [data-baseweb="tab"] { font-weight:600; font-size:.85rem; letter-spacing:.04em; text-transform:uppercase; color:$muted !important; background:transparent !important; border:none !important; padding:12px 24px; }
-.stTabs [aria-selected="true"] { color:$primary !important; border-bottom:3px solid $accent !important; }
-.stDownloadButton button, .stButton button { background-color:$accent !important; color:#fff !important; font-weight:600 !important; letter-spacing:.06em !important; text-transform:uppercase !important; border:none !important; border-radius:4px !important; padding:10px 28px !important; }
-.stDownloadButton button:hover, .stButton button:hover { background-color:$accent_dark !important; }
-[data-testid="stFileUploader"] { background-color:$surface; border:2px dashed $border; border-radius:6px; padding:10px; }
-[data-testid="metric-container"] { background-color:$surface; border:1px solid $border; border-top:4px solid $accent; padding:16px; border-radius:6px; box-shadow:0 2px 8px rgba(27,42,56,.08); }
-[data-testid="stMetricValue"] { font-size:1.8rem !important; font-weight:700 !important; color:$primary !important; }
-[data-testid="stMetricLabel"] { color:$muted !important; font-size:.7rem !important; text-transform:uppercase; letter-spacing:.1em; }
+[data-testid="metric-container"], [data-testid="stMetric"] { background-color:$surface; border:1px solid $border; border-top:4px solid $accent; padding:16px; border-radius:6px; box-shadow:0 2px 8px rgba(27,42,56,.08); }
+[data-testid="stMetricValue"], [data-testid="stMetricValue"] div { font-size:1.8rem !important; font-weight:700 !important; color:$primary !important; }
+[data-testid="stMetricLabel"], [data-testid="stMetricLabel"] p { color:$muted !important; font-size:.7rem !important; text-transform:uppercase; letter-spacing:.1em; }
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p { color:$muted !important; }
+[data-testid="stAlert"] p, .stAlert p { color:$text !important; }
 div[data-testid="stVerticalBlock"] { gap:0.5rem; }
-.stAlert { background-color:$grid !important; border-color:$primary !important; color:$text !important; }
+
+/* ── Chrome ── */
 [data-testid="stToolbar"] { display: none !important; }
 header[data-testid="stHeader"] { background: transparent !important; }
 /* No sidebar in this app: hide it and its expand control entirely */
@@ -259,9 +338,13 @@ def login_screen():
             st.stop()
 
         with st.form("sign_in"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Sign in")
+            st.markdown('<div class="login-title">Sign in</div>'
+                        '<div class="login-hint">Use the account the report owner set up for you.</div>',
+                        unsafe_allow_html=True)
+            username = st.text_input("Username", placeholder="Your username")
+            password = st.text_input("Password", type="password",
+                                     placeholder="Your password")
+            submitted = st.form_submit_button("Sign in", use_container_width=True)
 
         if submitted:
             key = username.strip().lower()
