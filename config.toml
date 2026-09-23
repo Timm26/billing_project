@@ -1,4 +1,3 @@
-# .streamlit/config.toml — safe to commit (no secrets here).
 # Forces the light theme so the app does not follow a viewer's dark-mode
 # setting, which made labels, tab names and buttons unreadable.
 [theme]
