@@ -1259,18 +1259,28 @@ def bpo_currency_summary(detail):
 
 
 def bpo_code_summary(detail):
-    """Sheet 1, lower table: the local ex-tax total split by charge code."""
+    """Sheet 1, lower table: spend by BPO, charge code and charge currency.
+
+    One row per BPO, charge code and currency, so a code billed in both NZD
+    and USD shows twice. Each row carries the amount in its own currency next
+    to its local equivalent; the share of the BPO is taken on the local
+    figure, the only one that can be added across currencies.
+    """
     work = detail[detail["Charge Code"].astype(str).str.strip() != ""]
     if work.empty:
         return pd.DataFrame()
-    summary = work.groupby(["Group", "Leg", "BPO", "Charge Code"],
+    summary = work.groupby(["Group", "Leg", "BPO", "Charge Code", "Currency"],
                            observed=True).agg(
         Description=("Description", "first"),
         Containers=("Container", "nunique"),
         Charge_Lines=("Charge Code", "count"),
-        **{CB_LOCAL_EX_LABEL: (CB_ALLOC_EX, "sum")},
+        **{CB_CCY_EX_LABEL: (CB_AMOUNT_CCY, "sum"),
+           CB_LOCAL_EX_LABEL: (CB_ALLOC_EX, "sum")},
     ).reset_index()
-    summary[CB_LOCAL_EX_LABEL] = summary[CB_LOCAL_EX_LABEL].round(2)
+    summary["BPO Currency"] = [bpo_for(g, l)["BPO Currency"]
+                               for g, l in zip(summary["Group"], summary["Leg"])]
+    for col in (CB_CCY_EX_LABEL, CB_LOCAL_EX_LABEL):
+        summary[col] = summary[col].round(2)
     summary["Share_of_BPO_%"] = (
         100 * summary[CB_LOCAL_EX_LABEL]
         / summary.groupby(["Group", "BPO"])[CB_LOCAL_EX_LABEL].transform("sum")
@@ -1279,11 +1289,13 @@ def bpo_code_summary(detail):
     summary["_g"] = summary["Group"].map(bpo_group_rank)
     summary["_l"] = summary["Leg"].map(
         {l: i for i, l in enumerate(BPO_LEG_ORDER)}).fillna(len(BPO_LEG_ORDER))
-    ordered = ["Group", "Leg", "BPO", "Charge Code", "Description", "Containers",
-               "Charge_Lines", CB_LOCAL_EX_LABEL, "Share_of_BPO_%"]
-    return (summary.sort_values(["_g", "_l", "BPO", CB_LOCAL_EX_LABEL],
-                                ascending=[True, True, True, False])
-            .drop(columns=["_g", "_l"]).reset_index(drop=True)[ordered])
+    summary["_c"] = summary["Currency"].ne(CB_LOCAL_CCY)
+    ordered = ["Group", "Leg", "BPO", "BPO Currency", "Charge Code", "Description",
+               "Currency", "Containers", "Charge_Lines", CB_CCY_EX_LABEL,
+               CB_LOCAL_EX_LABEL, "Share_of_BPO_%"]
+    return (summary.sort_values(["_g", "_l", "BPO", "_c", "Currency", CB_LOCAL_EX_LABEL],
+                                ascending=[True, True, True, True, True, False])
+            .drop(columns=["_g", "_l", "_c"]).reset_index(drop=True)[ordered])
 
 
 def bpo_shipment_groups(detail):
@@ -1541,7 +1553,8 @@ def bpo_write_summary_sheet(writer, detail, sheet_name="BPO Summary",
     codes = bpo_code_summary(detail)
     if not codes.empty:
         row = write_table(max(row + 2, second_table_row),
-                          f"{CB_LOCAL_EX_LABEL.upper()} BY CHARGE CODE", codes)
+                          "SPEND BY BPO, CHARGE CODE AND CURRENCY "
+                          f"(original amount and {CB_LOCAL_CCY} equivalent)", codes)
     currencies = bpo_currency_summary(detail)
     if not currencies.empty:
         row = write_table(row + 2, "TOTALS BY CHARGE CURRENCY "
