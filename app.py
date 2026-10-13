@@ -510,6 +510,10 @@ CB_CHARGE_CODE_COL = "Charges"
 CB_JOB_COL = "Job"
 CB_REPORT_FILENAME = "container_charge_breakdown.xlsx"
 CB_NO_CONTAINER = "(no container listed)"
+# A billed job that no uploaded listing carries. Its charges are kept, at job
+# level on one row, rather than dropped — so no currency silently disappears.
+CB_NOT_IN_LISTING = "(job not in shipment listing)"
+CB_DEPT_COL = "Dept"
 
 # A job reference is a single letter followed by digits (S04944911). Carrier
 # and B/L references carry two or three letters, so this discriminates.
@@ -754,6 +758,11 @@ def cb_build_charge_detail(billing_df, shipment_df):
 
     Returns (detail, diagnostics). Each charge line's amounts are split evenly
     across the job's containers in whole cents, so the parts add back exactly.
+
+    A job on the billing export that no uploaded listing carries is not
+    dropped: its lines are kept on a single '(job not in shipment listing)'
+    row, in their own currency, and its trade group is taken from the billing
+    department code instead of the ports (see BPO_GROUP_BY_DEPT).
     """
     diagnostics = {"missing_columns": [], "unmatched_jobs": [],
                    "jobs_without_containers": []}
@@ -769,6 +778,14 @@ def cb_build_charge_detail(billing_df, shipment_df):
     numeric_cols = [c for c in ("Amount", "Tax", "Total", "Local Amount", "Local Total")
                     if c in billing_df.columns]
 
+    # Majority department per job, used only for jobs missing from the listing.
+    job_dept = {}
+    if CB_DEPT_COL in billing_df.columns:
+        depts = billing_df[[CB_JOB_COL, CB_DEPT_COL]].dropna().astype(str)
+        depts[CB_JOB_COL] = depts[CB_JOB_COL].str.strip()
+        for job, values in depts.groupby(CB_JOB_COL)[CB_DEPT_COL]:
+            job_dept[job] = values.str.strip().str.upper().mode().iloc[0]
+
     records = []
     for line in billing_df.to_dict("records"):
         job = str(line[CB_JOB_COL]).strip()
@@ -776,7 +793,8 @@ def cb_build_charge_detail(billing_df, shipment_df):
         if group is None:
             if job not in diagnostics["unmatched_jobs"]:
                 diagnostics["unmatched_jobs"].append(job)
-            continue
+            group = pd.DataFrame([{"Job": job, "Container": CB_NOT_IN_LISTING,
+                                   "Container Size": "", "Position": 1}])
         if list(group["Container"]) == [CB_NO_CONTAINER]:
             if job not in diagnostics["jobs_without_containers"]:
                 diagnostics["jobs_without_containers"].append(job)
@@ -793,7 +811,9 @@ def cb_build_charge_detail(billing_df, shipment_df):
                 "Charge Code": str(line[CB_CHARGE_CODE_COL]).strip().upper(),
                 "Description": line.get("Description"),
                 "Currency": line.get("Currency"),
+                "Exchange Rate": pd.to_numeric(line.get("Exchange Rate"), errors="coerce"),
                 "Containers on Job": parts,
+                "Job Dept": job_dept.get(job, ""),
             }
             for col in CB_CONTEXT_COLS:
                 if col in container.index:
@@ -811,7 +831,8 @@ def cb_build_charge_detail(billing_df, shipment_df):
 
     detail = pd.DataFrame(records)
     ordered = ["Job", "Container", "Container Size", "Charge Code", "Description",
-               "Currency", "Containers on Job", "Line Total (ex tax)"]
+               "Currency", "Exchange Rate", "Containers on Job", "Job Dept",
+               "Line Total (ex tax)"]
     allocated = [c for c in detail.columns if c.startswith("Allocated")]
     context = [c for c in CB_CONTEXT_COLS if c in detail.columns]
     tail = [c for c in ("Charge Date",) if c in detail.columns]
@@ -862,6 +883,15 @@ BPO_GROUP_ORDER = [BPO_GROUP_DOMESTIC, BPO_GROUP_EXPORT,
 # Overrides for named lane pairs, if one ever has to sit outside the direction
 # rule: {("AU", "NZ"): BPO_GROUP_IMPORT}. Normally left empty.
 BPO_GROUP_RULES = {}
+
+# Fallback for a billed job that is not in any uploaded listing, so has no
+# ports to judge by: the billing export's department code (the job's majority
+# department) decides the group. Forwarding Export / Import / Domestic, Sea.
+BPO_GROUP_BY_DEPT = {
+    "FES": BPO_GROUP_EXPORT,
+    "FIS": BPO_GROUP_IMPORT,
+    "FDS": BPO_GROUP_DOMESTIC,
+}
 
 # Who receives the invoice for each group.
 BPO_INVOICE_TO = {
@@ -974,6 +1004,9 @@ CB_INC_CCY = "Allocated Total"
 
 CB_LOCAL_EX_LABEL = f"Local ex Tax ({CB_LOCAL_CCY})"
 CB_LOCAL_INC_LABEL = f"Local inc Tax ({CB_LOCAL_CCY})"
+# Amount in the currency the charge was raised in (USD, AUD, ...), read
+# together with the row's Currency column. Never added across currencies.
+CB_CCY_EX_LABEL = "Amount ex Tax (charge ccy)"
 
 # One matrix row per container, currency and BPO: every row is billable as it
 # stands, with no mixing of BPOs inside a row.
@@ -1033,7 +1066,13 @@ def bpo_annotate(detail):
     dest = (out["Destination"] if "Destination" in out.columns
             else pd.Series("", index=out.index))
 
-    out["Group"] = [bpo_classify_group(o, d) for o, d in zip(origin, dest)]
+    dept = (out["Job Dept"] if "Job Dept" in out.columns
+            else pd.Series("", index=out.index))
+    out["Group"] = [
+        BPO_GROUP_BY_DEPT.get(str(dp).strip().upper(), BPO_GROUP_OTHER)
+        if container == CB_NOT_IN_LISTING else bpo_classify_group(o, d)
+        for o, d, dp, container in zip(origin, dest, dept, out["Container"])
+    ]
     out["Leg"] = [bpo_leg_for_code(c) for c in out["Charge Code"]]
 
     records = [bpo_for(g, l) for g, l in zip(out["Group"], out["Leg"])]
@@ -1152,8 +1191,8 @@ def bpo_summary(detail):
     summary = detail.groupby(["Group", "Leg", "BPO", "Currency"], observed=True).agg(
         Shipments=("Job", "nunique"),
         Containers=("Container", "nunique"),
-        Total_ex_Tax=(CB_AMOUNT_CCY, "sum"),
-        **{CB_LOCAL_EX_LABEL: (CB_ALLOC_EX, "sum")},
+        **{CB_CCY_EX_LABEL: (CB_AMOUNT_CCY, "sum"),
+           CB_LOCAL_EX_LABEL: (CB_ALLOC_EX, "sum")},
     ).reset_index()
 
     records = [bpo_for(g, l) for g, l in zip(summary["Group"], summary["Leg"])]
@@ -1161,7 +1200,7 @@ def bpo_summary(detail):
     summary["BPO Entity"] = [r["BPO Entity"] for r in records]
     summary["BPO Currency"] = [r["BPO Currency"] for r in records]
     summary["Invoice To"] = summary["Group"].map(BPO_INVOICE_TO).fillna(BPO_TBA)
-    for col in ("Total_ex_Tax", CB_LOCAL_EX_LABEL):
+    for col in (CB_CCY_EX_LABEL, CB_LOCAL_EX_LABEL):
         summary[col] = summary[col].round(2)
 
     summary["_g"] = summary["Group"].map(bpo_group_rank)
@@ -1169,9 +1208,54 @@ def bpo_summary(detail):
         {l: i for i, l in enumerate(BPO_LEG_ORDER)}).fillna(len(BPO_LEG_ORDER))
     ordered = ["Group", "Invoice To", "Leg", "BPO", "BPO Vendor", "BPO Entity",
                "BPO Currency", "Currency", "Shipments", "Containers",
-               "Total_ex_Tax", CB_LOCAL_EX_LABEL]
-    return (summary.sort_values(["_g", "_l", "Currency"]).drop(columns=["_g", "_l"])
-            .reset_index(drop=True)[ordered])
+               CB_CCY_EX_LABEL, CB_LOCAL_EX_LABEL]
+    summary["_c"] = summary["Currency"].ne(CB_LOCAL_CCY)
+    return (summary.sort_values(["_g", "_l", "_c", "Currency"])
+            .drop(columns=["_g", "_l", "_c"]).reset_index(drop=True)[ordered])
+
+
+def bpo_currency_summary(detail):
+    """One row per group and charge currency, then one total row per currency.
+
+    Shows each currency in its own original amount next to its local
+    equivalent, so a USD invoice reads as USD 14,839.00 and not only as the
+    NZD it converts to. Amounts in different currencies are never added.
+    """
+    work = detail[detail["Charge Code"].astype(str).str.strip() != ""].copy()
+    if work.empty:
+        return pd.DataFrame()
+    # The detail holds one row per charge line per container; each row is that
+    # fraction of one invoice line, so the sum counts the invoice lines.
+    work["_line"] = 1 / pd.to_numeric(work["Containers on Job"],
+                                      errors="coerce").fillna(1).clip(lower=1)
+
+    def roll(frame, keys):
+        out = frame.groupby(keys, observed=True).agg(
+            Shipments=("Job", "nunique"),
+            Containers=("Container", "nunique"),
+            Invoice_Lines=("_line", "sum"),
+            **{CB_CCY_EX_LABEL: (CB_AMOUNT_CCY, "sum"),
+               CB_LOCAL_EX_LABEL: (CB_ALLOC_EX, "sum")},
+        ).reset_index()
+        out["Invoice_Lines"] = out["Invoice_Lines"].round().astype(int)
+        return out
+
+    by_group = roll(work, ["Group", "Currency"])
+    by_ccy = roll(work, ["Currency"])
+    by_ccy.insert(0, "Group", "ALL GROUPS")
+    summary = pd.concat([by_group, by_ccy], ignore_index=True)
+
+    for col in (CB_CCY_EX_LABEL, CB_LOCAL_EX_LABEL):
+        summary[col] = summary[col].round(2)
+    summary["Rate (charge ccy per 1 " + CB_LOCAL_CCY + ")"] = (
+        summary[CB_CCY_EX_LABEL] / summary[CB_LOCAL_EX_LABEL].replace(0, pd.NA)
+    ).astype(float).round(4)
+
+    summary["_g"] = summary["Group"].map(
+        lambda g: bpo_group_rank(g) if g != "ALL GROUPS" else len(BPO_GROUP_ORDER) + 1)
+    summary["_c"] = summary["Currency"].ne(CB_LOCAL_CCY)
+    return (summary.sort_values(["_g", "_c", "Currency"])
+            .drop(columns=["_g", "_c"]).reset_index(drop=True))
 
 
 def bpo_code_summary(detail):
@@ -1215,7 +1299,7 @@ def bpo_shipment_groups(detail):
             "Leg": ", ".join(legs),
             "Currency": currency,
             "Containers": part["Container"].nunique(),
-            "Total_ex_Tax": round(part[CB_AMOUNT_CCY].sum(), 2),
+            CB_CCY_EX_LABEL: round(part[CB_AMOUNT_CCY].sum(), 2),
             CB_LOCAL_EX_LABEL: round(part[CB_ALLOC_EX].sum(), 2),
         }
         for col in ("Consignor", "Origin", "Destination", "ETD"):
@@ -1225,17 +1309,19 @@ def bpo_shipment_groups(detail):
 
     frame = pd.DataFrame(rows)
     frame["_g"] = frame["Group"].map(bpo_group_rank)
-    return (frame.sort_values(["_g", "Job", "Currency", "BPO"])
-            .drop(columns="_g").reset_index(drop=True))
+    frame["_c"] = frame["Currency"].ne(CB_LOCAL_CCY)
+    return (frame.sort_values(["_g", "Job", "_c", "Currency", "BPO"])
+            .drop(columns=["_g", "_c"]).reset_index(drop=True))
 
 
 def bpo_charge_detail(detail):
     """Sheet 4: the charge lines, trimmed to the columns that get read."""
     cols = ["Group", "Job", "Container", "Container Size", "Charge Code",
             "Description", "Leg", "BPO", "Currency", CB_AMOUNT_CCY,
-            CB_ALLOC_EX, "Consignor", "Origin", "Destination", "ETD"]
+            "Exchange Rate", CB_ALLOC_EX, "Consignor", "Origin", "Destination",
+            "ETD"]
     out = detail[[c for c in cols if c in detail.columns]].copy()
-    return out.rename(columns={CB_AMOUNT_CCY: "Amount (charge ccy)",
+    return out.rename(columns={CB_AMOUNT_CCY: CB_CCY_EX_LABEL,
                                CB_ALLOC_EX: CB_LOCAL_EX_LABEL})
 
 
@@ -1300,8 +1386,9 @@ def bpo_group_matrix(detail, group):
              .round(2).reset_index().rename(columns={CB_ALLOC_EX: CB_LOCAL_EX_LABEL}))
     matrix = pd.merge(matrix, local, how="left", on=CB_MATRIX_KEYS)
 
-    matrix = (matrix.sort_values(["Job", "Container", "Currency", "BPO"])
-              .reset_index(drop=True))
+    matrix["_c"] = matrix["Currency"].ne(CB_LOCAL_CCY)
+    matrix = (matrix.sort_values(["Job", "Container", "_c", "Currency", "BPO"])
+              .drop(columns="_c").reset_index(drop=True))
     return matrix, subtotal_cols
 
 
@@ -1391,9 +1478,10 @@ def cb_write_sheet(writer, name, df, number_format="#,##0.00", band_by=None):
         longest = max((len(str(c.value)) for c in column[:200] if c.value is not None),
                       default=10)
         ws.column_dimensions[letter].width = min(max(longest + 2, 10), 46)
+        is_rate = "rate" in str(column[0].value).lower()
         for cell in column[1:]:
             if isinstance(cell.value, (int, float)):
-                cell.number_format = number_format
+                cell.number_format = "0.0000" if is_rate else number_format
 
     if band_by:
         keys = [c for c in band_by if c in df.columns]
@@ -1414,7 +1502,7 @@ def cb_write_sheet(writer, name, df, number_format="#,##0.00", band_by=None):
 
 def bpo_write_summary_sheet(writer, detail, sheet_name="BPO Summary",
                             second_table_row=12, number_format="#,##0.00"):
-    """Sheet 1: the BPO table, then the same spend split by charge code.
+    """Sheet 1: the BPO table, the spend by charge code, then totals by currency.
 
     The second table starts at `second_table_row` (or below the first table if
     that has grown past it), so its position is predictable for anything
@@ -1438,9 +1526,15 @@ def bpo_write_summary_sheet(writer, detail, sheet_name="BPO Summary",
             if previous is not None and key != previous:
                 shaded = not shaded
             previous = key
-            row = _bpo_write_row(ws, row, [record[c] for c in frame.columns],
-                                 fill=CB_BAND_FILL if shaded else None,
-                                 number_format=number_format)
+            bold = str(record.get("Group", "")) == "ALL GROUPS"
+            _bpo_write_row(ws, row, [record[c] for c in frame.columns],
+                           fill=CB_BAND_FILL if shaded else None, bold=bold,
+                           number_format=number_format)
+            # Exchange rates read to four places, not two.
+            for offset, column in enumerate(frame.columns, start=1):
+                if str(column).startswith("Rate") and isinstance(record[column], float):
+                    ws.cell(row=row, column=offset).number_format = "0.0000"
+            row += 1
         return row
 
     row = write_table(1, "BPO ALLOCATION", bpo_summary(detail))
@@ -1448,6 +1542,10 @@ def bpo_write_summary_sheet(writer, detail, sheet_name="BPO Summary",
     if not codes.empty:
         row = write_table(max(row + 2, second_table_row),
                           f"{CB_LOCAL_EX_LABEL.upper()} BY CHARGE CODE", codes)
+    currencies = bpo_currency_summary(detail)
+    if not currencies.empty:
+        row = write_table(row + 2, "TOTALS BY CHARGE CURRENCY "
+                          "(original amount and local equivalent)", currencies)
 
     _bpo_fit_columns(ws, skip_rows=layout_rows)
     return ws
@@ -2035,15 +2133,23 @@ def render_container_breakdown():
     k3.metric("BPOs", f"{detail['BPO'].nunique():,}")
     k4.metric(f"Total ex tax ({CB_LOCAL_CCY})", f"{total_ex:,.2f}")
 
+    if with_charges:
+        by_ccy = (detail.groupby("Currency")[CB_AMOUNT_CCY].sum().round(2))
+        order = bpo_currencies_in(detail)
+        st.caption("Charged ex tax, in original currency:  " + "   ·   ".join(
+            f"{ccy} {by_ccy.get(ccy, 0):,.2f}" for ccy in order))
+
     if diag["unmatched_jobs"] and billing is not None:
         missing = billing[billing[CB_JOB_COL].astype(str).str.strip()
                           .isin(diag["unmatched_jobs"])]
         missing_total = pd.to_numeric(missing["Local Amount"], errors="coerce").fillna(0).sum()
         st.warning(
             f"{len(diag['unmatched_jobs'])} job(s) on the billing export are not in any "
-            f"uploaded shipment listing, so {CB_LOCAL_CCY} {missing_total:,.2f} ex tax is "
-            "excluded from the breakdown: " + ", ".join(sorted(diag["unmatched_jobs"])) +
-            ". Upload the listing that contains them to include them."
+            f"uploaded shipment listing: " + ", ".join(sorted(diag["unmatched_jobs"])) +
+            f". Their charges ({CB_LOCAL_CCY} {missing_total:,.2f} ex tax) are kept, in "
+            f"their own currencies, on a single '{CB_NOT_IN_LISTING}' row per job, "
+            "with the trade group taken from the billing department code. Upload the "
+            "listing that contains them to split them across their containers."
         )
 
     placeholders = detail["Container"].astype(str).str.contains(
@@ -2086,7 +2192,8 @@ def render_container_breakdown():
 
     views = ["Container matrix", "Per BPO", "Per group", "Per shipment"]
     if with_charges:
-        views = ["Charge detail"] + views + ["Per container", "Per charge code"]
+        views = (["Charge detail"] + views
+                 + ["Per currency", "Per container", "Per charge code"])
     view = st.radio("View", views, horizontal=True, key="cb_view",
                     label_visibility="collapsed")
 
@@ -2109,6 +2216,12 @@ def render_container_breakdown():
     elif view == "Per shipment":
         st.dataframe(bpo_shipment_groups(view_detail), use_container_width=True,
                      hide_index=True)
+    elif view == "Per currency":
+        st.dataframe(bpo_currency_summary(view_detail), use_container_width=True,
+                     hide_index=True)
+        st.caption(f"Each charge currency in its original amount beside its "
+                   f"{CB_LOCAL_CCY} equivalent. Amounts in different currencies "
+                   "are never added together.")
     elif view == "Per container":
         st.dataframe(cb_container_summary(view_detail), use_container_width=True,
                      hide_index=True)
@@ -2138,21 +2251,37 @@ def render_container_breakdown():
                    f"Charge Detail")
 
     if with_charges and billing is not None:
+        # Every billed line is now carried, so the breakdown should equal the
+        # export exactly: in local currency overall, and in each charge
+        # currency on its own.
         source_total = pd.to_numeric(billing["Local Amount"], errors="coerce").fillna(0).sum()
-        unmatched_total = 0.0
-        if diag["unmatched_jobs"]:
-            unmatched = billing[billing[CB_JOB_COL].astype(str).str.strip()
-                                .isin(diag["unmatched_jobs"])]
-            unmatched_total = pd.to_numeric(unmatched["Local Amount"],
-                                            errors="coerce").fillna(0).sum()
-        difference = round(total_ex + unmatched_total - source_total, 2)
-        if abs(difference) < 0.01:
-            st.success(f"Reconciled: allocated {CB_LOCAL_CCY} {total_ex:,.2f} plus "
-                       f"{CB_LOCAL_CCY} {unmatched_total:,.2f} unmatched equals the "
-                       f"export's {CB_LOCAL_CCY} {source_total:,.2f}.")
+        difference = round(total_ex - source_total, 2)
+
+        source_ccy = billing.assign(
+            _ccy=(billing["Currency"].fillna(CB_LOCAL_CCY).astype(str).str.strip()
+                  .str.upper() if "Currency" in billing.columns else CB_LOCAL_CCY),
+            _amt=(pd.to_numeric(billing["Amount"], errors="coerce").fillna(0)
+                  if "Amount" in billing.columns else 0.0),
+        ).groupby("_ccy")["_amt"].sum()
+        alloc_ccy = detail.groupby("Currency")[CB_AMOUNT_CCY].sum()
+        ccy_breaks = [
+            f"{ccy} {alloc_ccy.get(ccy, 0) - source_ccy.get(ccy, 0):+,.2f}"
+            for ccy in sorted(set(source_ccy.index) | set(alloc_ccy.index))
+            if abs(alloc_ccy.get(ccy, 0) - source_ccy.get(ccy, 0)) >= 0.01
+        ]
+        ccy_text = "   ·   ".join(f"{ccy} {source_ccy[ccy]:,.2f}"
+                                  for ccy in bpo_currencies_in(
+                                      pd.DataFrame({"Currency": source_ccy.index})))
+
+        if abs(difference) < 0.01 and not ccy_breaks:
+            st.success(f"Reconciled: allocated {CB_LOCAL_CCY} {total_ex:,.2f} equals the "
+                       f"export's {CB_LOCAL_CCY} {source_total:,.2f}, and every "
+                       f"currency matches the export ({ccy_text}).")
         else:
             st.error(f"Out by {CB_LOCAL_CCY} {difference:,.2f} against the export's "
-                     f"{CB_LOCAL_CCY} {source_total:,.2f}.")
+                     f"{CB_LOCAL_CCY} {source_total:,.2f}"
+                     + (f"; by currency: {', '.join(ccy_breaks)}" if ccy_breaks else "")
+                     + ".")
 
 
 # ── Projects ──────────────────────────────────────────────────────────────────
