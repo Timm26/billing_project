@@ -561,7 +561,8 @@ CB_SHIPMENT_MAP = {
 }
 
 CB_CONTEXT_COLS = ["Consignor", "Origin", "Destination", "Discharge Port",
-                   "Vessel", "Shipping Line", "Mode", "Incoterms", "ETD", "ETA"]
+                   "Vessel", "Shipping Line", "Master B/L", "Mode", "Incoterms",
+                   "ETD", "ETA"]
 
 
 def cb_find_header_row(raw, min_markers=3):
@@ -960,6 +961,24 @@ BPO_LEG_BY_CODE = {
 
 BPO_TBA = "TBA"
 
+# A leg whose BPO has not been issued stays on TBA in the BPO split. Those
+# charges are then listed again in their own section, one block per shipment
+# Master B/L number (MBL is shipment specific), so they can be chased and
+# invoiced per shipment until the BPO arrives.
+BPO_STATUS_ISSUED = "Issued"
+BPO_STATUS_MISSING = "Missing (TBA)"
+CB_NO_MBL = "(no MBL in listing)"
+
+
+def bpo_status(record):
+    return BPO_STATUS_MISSING if record["BPO"] == BPO_TBA else BPO_STATUS_ISSUED
+
+
+def cb_mbl_value(value):
+    """Master B/L as text, or the '(no MBL in listing)' marker."""
+    text = "" if value is None or pd.isna(value) else str(value).strip()
+    return text if text and text.lower() != "nan" else CB_NO_MBL
+
 
 def _bpo_record(bpo, currency, entity, vendor):
     return {"BPO": bpo, "BPO Currency": currency,
@@ -1010,7 +1029,8 @@ CB_CCY_EX_LABEL = "Amount ex Tax (charge ccy)"
 
 # One matrix row per container, currency and BPO: every row is billable as it
 # stands, with no mixing of BPOs inside a row.
-CB_MATRIX_KEYS = ["Job", "Container", "Container Size", "Currency", "BPO"]
+CB_MATRIX_KEYS = ["Job", "Container", "Container Size", "Currency", "BPO",
+                  "Master B/L"]
 
 
 def bpo_country(port_code):
@@ -1077,6 +1097,10 @@ def bpo_annotate(detail):
 
     records = [bpo_for(g, l) for g, l in zip(out["Group"], out["Leg"])]
     out["BPO"] = [r["BPO"] for r in records]
+    out["BPO Status"] = [bpo_status(r) for r in records]
+    out["Master B/L"] = [cb_mbl_value(v) for v in
+                         (out["Master B/L"] if "Master B/L" in out.columns
+                          else [None] * len(out))]
     out["BPO Vendor"] = [r["BPO Vendor"] for r in records]
     out["BPO Entity"] = [r["BPO Entity"] for r in records]
     out["BPO Currency"] = [r["BPO Currency"] for r in records]
@@ -1123,6 +1147,8 @@ def bpo_shipment_skeleton(shipment_df):
                 "Group": group,
                 "Leg": leg,
                 "BPO": bpo["BPO"],
+                "BPO Status": bpo_status(bpo),
+                "Master B/L": cb_mbl_value(record.get("Master B/L")),
                 "BPO Vendor": bpo["BPO Vendor"],
                 "BPO Entity": bpo["BPO Entity"],
                 "BPO Currency": bpo["BPO Currency"],
@@ -1191,7 +1217,8 @@ def bpo_summary(detail):
     summary = detail.groupby(["Group", "Leg", "BPO", "Currency"], observed=True).agg(
         Shipments=("Job", "nunique"),
         Containers=("Container", "nunique"),
-        **{CB_CCY_EX_LABEL: (CB_AMOUNT_CCY, "sum"),
+        **{"BPO Status": ("BPO Status", "first"),
+           CB_CCY_EX_LABEL: (CB_AMOUNT_CCY, "sum"),
            CB_LOCAL_EX_LABEL: (CB_ALLOC_EX, "sum")},
     ).reset_index()
 
@@ -1206,7 +1233,7 @@ def bpo_summary(detail):
     summary["_g"] = summary["Group"].map(bpo_group_rank)
     summary["_l"] = summary["Leg"].map(
         {l: i for i, l in enumerate(BPO_LEG_ORDER)}).fillna(len(BPO_LEG_ORDER))
-    ordered = ["Group", "Invoice To", "Leg", "BPO", "BPO Vendor", "BPO Entity",
+    ordered = ["Group", "Invoice To", "Leg", "BPO", "BPO Status", "BPO Vendor", "BPO Entity",
                "BPO Currency", "Currency", "Shipments", "Containers",
                CB_CCY_EX_LABEL, CB_LOCAL_EX_LABEL]
     summary["_c"] = summary["Currency"].ne(CB_LOCAL_CCY)
@@ -1314,7 +1341,8 @@ def bpo_shipment_groups(detail):
             CB_CCY_EX_LABEL: round(part[CB_AMOUNT_CCY].sum(), 2),
             CB_LOCAL_EX_LABEL: round(part[CB_ALLOC_EX].sum(), 2),
         }
-        for col in ("Consignor", "Origin", "Destination", "ETD"):
+        for col in ("BPO Status", "Master B/L", "Consignor", "Origin",
+                    "Destination", "ETD"):
             if col in part.columns:
                 row[col] = part[col].iloc[0]
         rows.append(row)
@@ -1329,12 +1357,48 @@ def bpo_shipment_groups(detail):
 def bpo_charge_detail(detail):
     """Sheet 4: the charge lines, trimmed to the columns that get read."""
     cols = ["Group", "Job", "Container", "Container Size", "Charge Code",
-            "Description", "Leg", "BPO", "Currency", CB_AMOUNT_CCY,
-            "Exchange Rate", CB_ALLOC_EX, "Consignor", "Origin", "Destination",
-            "ETD"]
+            "Description", "Leg", "BPO", "BPO Status", "Currency", CB_AMOUNT_CCY,
+            "Exchange Rate", CB_ALLOC_EX, "Master B/L", "Consignor", "Origin",
+            "Destination", "ETD"]
     out = detail[[c for c in cols if c in detail.columns]].copy()
     return out.rename(columns={CB_AMOUNT_CCY: CB_CCY_EX_LABEL,
                                CB_ALLOC_EX: CB_LOCAL_EX_LABEL})
+
+
+def bpo_missing_by_mbl(detail):
+    """Charges on a missing (TBA) BPO, one row per MBL, leg and currency.
+
+    Ordered by trade group and then MBL, so each shipment's unbilled-against
+    charges read as one block.
+    """
+    if detail is None or detail.empty or "BPO Status" not in detail.columns:
+        return pd.DataFrame()
+    work = detail[detail["BPO Status"] == BPO_STATUS_MISSING]
+    if work.empty:
+        return pd.DataFrame()
+    summary = work.groupby(["Group", "Master B/L", "Leg", "Currency"],
+                           observed=True).agg(
+        Jobs=("Job", lambda j: ", ".join(sorted(set(j)))),
+        Containers=("Container", "nunique"),
+        **{CB_CCY_EX_LABEL: (CB_AMOUNT_CCY, "sum"),
+           CB_LOCAL_EX_LABEL: (CB_ALLOC_EX, "sum")},
+    ).reset_index()
+    summary = summary.rename(columns={"Master B/L": "MBL #"})
+    records = [bpo_for(g, l) for g, l in zip(summary["Group"], summary["Leg"])]
+    summary["BPO"] = BPO_TBA
+    summary["BPO Vendor"] = [r["BPO Vendor"] for r in records]
+    summary["BPO Entity"] = [r["BPO Entity"] for r in records]
+    for col in (CB_CCY_EX_LABEL, CB_LOCAL_EX_LABEL):
+        summary[col] = summary[col].round(2)
+    summary["_g"] = summary["Group"].map(bpo_group_rank)
+    summary["_m"] = summary["MBL #"].eq(CB_NO_MBL)
+    summary["_l"] = summary["Leg"].map(
+        {l: i for i, l in enumerate(BPO_LEG_ORDER)}).fillna(len(BPO_LEG_ORDER))
+    summary["_c"] = summary["Currency"].ne(CB_LOCAL_CCY)
+    ordered = ["Group", "MBL #", "Jobs", "Leg", "BPO", "BPO Vendor", "BPO Entity",
+               "Currency", "Containers", CB_CCY_EX_LABEL, CB_LOCAL_EX_LABEL]
+    return (summary.sort_values(["_g", "_m", "MBL #", "_l", "_c", "Currency"])
+            .drop(columns=["_g", "_m", "_l", "_c"]).reset_index(drop=True)[ordered])
 
 
 def bpo_unmapped_codes(detail):
@@ -1361,6 +1425,8 @@ def bpo_group_matrix(detail, group):
     # is how shipments billed without a container number used to disappear.
     part["Container Size"] = (part["Container Size"].fillna("").astype(str)
                               if "Container Size" in part.columns else "")
+    part["Master B/L"] = (part["Master B/L"].map(cb_mbl_value)
+                          if "Master B/L" in part.columns else CB_NO_MBL)
 
     matrix = part.pivot_table(
         index=CB_MATRIX_KEYS, columns="Charge Code", values=CB_AMOUNT_CCY,
@@ -1398,9 +1464,14 @@ def bpo_group_matrix(detail, group):
              .round(2).reset_index().rename(columns={CB_ALLOC_EX: CB_LOCAL_EX_LABEL}))
     matrix = pd.merge(matrix, local, how="left", on=CB_MATRIX_KEYS)
 
+    # Issued BPOs first, split by BPO; missing (TBA) BPOs last, split by MBL.
+    matrix["_tba"] = matrix["BPO"].eq(BPO_TBA)
+    matrix["_ref"] = matrix["BPO"].where(~matrix["_tba"], matrix["Master B/L"])
+    matrix["_m"] = matrix["_tba"] & matrix["Master B/L"].eq(CB_NO_MBL)
     matrix["_c"] = matrix["Currency"].ne(CB_LOCAL_CCY)
-    matrix = (matrix.sort_values(["Job", "Container", "_c", "Currency", "BPO"])
-              .drop(columns="_c").reset_index(drop=True))
+    matrix = (matrix.sort_values(["_tba", "_m", "_ref", "Job", "Container", "_c",
+                                  "Currency"])
+              .drop(columns=["_tba", "_ref", "_m", "_c"]).reset_index(drop=True))
     return matrix, subtotal_cols
 
 
@@ -1555,6 +1626,9 @@ def bpo_write_summary_sheet(writer, detail, sheet_name="BPO Summary",
         row = write_table(max(row + 2, second_table_row),
                           "SPEND BY BPO, CHARGE CODE AND CURRENCY "
                           f"(original amount and {CB_LOCAL_CCY} equivalent)", codes)
+    missing = bpo_missing_by_mbl(detail)
+    if not missing.empty:
+        row = write_table(row + 2, "BPO MISSING (TBA) — BY MBL #", missing)
     currencies = bpo_currency_summary(detail)
     if not currencies.empty:
         row = write_table(row + 2, "TOTALS BY CHARGE CURRENCY "
@@ -1595,8 +1669,10 @@ def bpo_write_grouped_matrix(writer, detail, sheet_name="Container Matrix",
             if leg not in subtotal_cols and leg not in set(part["Leg"]):
                 continue
             layout_rows.add(row)
+            reference = ("BPO TBA (missing) — listed by MBL # below"
+                         if record["BPO"] == BPO_TBA else f"BPO {record['BPO']}")
             row = _bpo_write_row(ws, row, [
-                f"{leg}:  BPO {record['BPO']}   ·   {record['BPO Currency']}   ·   "
+                f"{leg}:  {reference}   ·   {record['BPO Currency']}   ·   "
                 f"{record['BPO Entity']}   ·   Vendor {record['BPO Vendor']}"
             ], fill=BPO_LEGEND_FILL)
 
@@ -1607,21 +1683,53 @@ def bpo_write_grouped_matrix(writer, detail, sheet_name="Container Matrix",
             cell.alignment = Alignment(horizontal="center", vertical="center",
                                        wrap_text=True)
 
-        shaded = False
-        previous_job = None
-        for record in matrix.to_dict("records"):
-            if previous_job is not None and record["Job"] != previous_job:
-                shaded = not shaded
-            previous_job = record["Job"]
-            row = _bpo_write_row(ws, row, [record[c] for c in matrix.columns],
-                                 fill=CB_BAND_FILL if shaded else None,
-                                 number_format=number_format)
-
         value_cols = list(matrix.columns[len(CB_MATRIX_KEYS):])
+        ccy_at = list(matrix.columns).index("Currency")
+
+        def write_section(rows, key, label):
+            """Rows split by `key`, each block closed by a subtotal per currency."""
+            nonlocal row
+            for value in dict.fromkeys(rows[key]):
+                block = rows[rows[key] == value]
+                shaded, previous_job = False, None
+                for record in block.to_dict("records"):
+                    if previous_job is not None and record["Job"] != previous_job:
+                        shaded = not shaded
+                    previous_job = record["Job"]
+                    row = _bpo_write_row(ws, row, [record[c] for c in matrix.columns],
+                                         fill=CB_BAND_FILL if shaded else None,
+                                         number_format=number_format)
+                for currency in bpo_currencies_in(block):
+                    in_ccy = block[block["Currency"] == currency]
+                    sub = [""] * len(CB_MATRIX_KEYS)
+                    sub[0] = label(value, in_ccy)
+                    sub[ccy_at] = currency
+                    for column in value_cols:
+                        total = round(float(in_ccy[column].sum()), 2)
+                        sub.append(total if total else "")
+                    row = _bpo_write_row(ws, row, sub, fill=BPO_LEGEND_FILL, bold=True,
+                                         number_format=number_format)
+
+        issued = matrix[matrix["BPO"] != BPO_TBA]
+        missing = matrix[matrix["BPO"] == BPO_TBA]
+        if not issued.empty:
+            write_section(issued, "BPO", lambda bpo, _: f"Subtotal BPO {bpo}")
+        if not missing.empty:
+            row += 1
+            layout_rows.add(row)
+            row = _bpo_write_row(ws, row, [
+                f"BPO MISSING (TBA)  ·  by MBL #  ·  "
+                f"{missing['Master B/L'].nunique()} MBL(s)  ·  "
+                f"{missing['Job'].nunique()} shipment(s)"
+            ], fill=BPO_GROUP_FILL, bold=True, colour="FFFFFF")
+            write_section(missing, "Master B/L", lambda mbl, b: (
+                f"Subtotal MBL {mbl}  ({', '.join(sorted(set(b['Job'])))})"))
+
         first = True
         for currency in bpo_currencies_in(matrix):
             rows_in_ccy = matrix[matrix["Currency"] == currency]
-            totals = [f"TOTAL {currency}", "", "", currency, ""]
+            totals = [""] * len(CB_MATRIX_KEYS)
+            totals[0], totals[ccy_at] = f"TOTAL {currency}", currency
             for column in value_cols:
                 total = round(float(rows_in_ccy[column].sum()), 2)
                 totals.append(total if total else "")
@@ -1640,7 +1748,7 @@ def bpo_write_grouped_matrix(writer, detail, sheet_name="Container Matrix",
         row += 2  # blank line between groups
 
     _bpo_fit_columns(ws, skip_rows=layout_rows, limit=(11, 30))
-    ws.freeze_panes = "F1"
+    ws.freeze_panes = "G1"
     return ws
 
 
@@ -2182,6 +2290,18 @@ def render_container_breakdown():
             f"so their charges sit against a '{CB_NO_CONTAINER}' row rather than being dropped."
         )
 
+    missing_bpo = bpo_missing_by_mbl(detail)
+    if not missing_bpo.empty:
+        no_mbl = sorted(set(", ".join(missing_bpo.loc[
+            missing_bpo["MBL #"] == CB_NO_MBL, "Jobs"]).split(", ")) - {""})
+        st.warning(
+            f"{missing_bpo['MBL #'].nunique()} MBL(s) across "
+            f"{detail.loc[detail['BPO Status'] == BPO_STATUS_MISSING, 'Job'].nunique()} "
+            "shipment(s) have a leg with no BPO issued (TBA). They stay on TBA in the "
+            "BPO split and are listed by MBL # in the 'Missing BPO by MBL' view and "
+            "workbook sections."
+            + (f" No MBL in the listing for: {', '.join(no_mbl)}." if no_mbl else ""))
+
     unmapped = bpo_unmapped_codes(detail)
     if unmapped:
         st.warning(
@@ -2203,7 +2323,8 @@ def render_container_breakdown():
         st.warning("No rows match the selected group.")
         return
 
-    views = ["Container matrix", "Per BPO", "Per group", "Per shipment"]
+    views = ["Container matrix", "Per BPO", "Missing BPO by MBL", "Per group",
+             "Per shipment"]
     if with_charges:
         views = (["Charge detail"] + views
                  + ["Per currency", "Per container", "Per charge code"])
@@ -2223,6 +2344,12 @@ def render_container_breakdown():
         st.dataframe(bpo_summary(view_detail), use_container_width=True, hide_index=True)
         st.caption("Compare the Currency and BPO Currency columns: a difference means "
                    "the charge was raised in a currency other than the BPO's.")
+    elif view == "Missing BPO by MBL":
+        missing_view = bpo_missing_by_mbl(view_detail)
+        if missing_view.empty:
+            st.success("Every leg in this selection has a BPO issued.")
+        else:
+            st.dataframe(missing_view, use_container_width=True, hide_index=True)
     elif view == "Per group":
         st.dataframe(bpo_group_summary(view_detail), use_container_width=True,
                      hide_index=True)
