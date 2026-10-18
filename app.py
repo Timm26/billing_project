@@ -1801,6 +1801,29 @@ def bpo_write_grouped_matrix(writer, detail, sheet_name="Container Matrix",
     return ws
 
 
+CB_LOADING_HTML = Template("""
+<style>
+@keyframes cb-spin { to { transform: rotate(360deg); } }
+.cb-loading { display:inline-flex; align-items:center; gap:12px; padding:10px 18px;
+  background:$surface; border:1px solid $border; border-left:4px solid $accent;
+  border-radius:6px; color:$text; font-weight:600; font-size:.9rem; }
+.cb-loading .cb-spinner { width:18px; height:18px; border-radius:50%;
+  border:3px solid $border; border-top-color:$accent; animation:cb-spin .8s linear infinite; }
+.cb-loading small { display:block; color:$muted; font-weight:400; font-size:.78rem; }
+</style>
+<div class="cb-loading"><div class="cb-spinner"></div>
+  <div>Generating the Excel report…<small>The download button appears here when it is ready.</small></div>
+</div>
+""").safe_substitute(surface=SURFACE, border=BORDER, accent=ACCENT, text=TEXT, muted=MUTED)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def cb_report_bytes(detail):
+    """The workbook as bytes, cached on the data so switching on-screen views
+    or group filters does not rebuild it."""
+    return cb_create_report(detail).getvalue()
+
+
 def cb_create_report(detail):
     """The four-sheet workbook: BPO summary, matrix, shipment groups, detail."""
     buf = io.BytesIO()
@@ -2247,7 +2270,8 @@ def render_container_breakdown():
                 "BPO structure, with no amounts.")
         return
 
-    download_slot = st.container()
+    download_slot = st.empty()
+    download_slot.markdown(CB_LOADING_HTML, unsafe_allow_html=True)
 
     with st.spinner("Reading the shipment listing…"):
         shipment_df, job_cols, read_errors = cb_read_shipments(shipment_files)
@@ -2257,6 +2281,7 @@ def render_container_breakdown():
         st.error("No shipment rows were found. Check that the listing contains a "
                  "job reference column and container numbers. Legacy .xls files "
                  "need the xlrd package installed.")
+        download_slot.empty()  # clear the loader
         return
 
     billing = None
@@ -2272,6 +2297,7 @@ def render_container_breakdown():
                 except Exception as e:
                     st.error(f"Could not read {uploaded.name}: {e}")
             if not sheets:
+                download_slot.empty()  # clear the loader
                 return
             billing = cb_clean_billing(pd.concat(sheets, ignore_index=True))
             detail, diag = cb_build_charge_detail(billing, shipment_df)
@@ -2279,14 +2305,17 @@ def render_container_breakdown():
 
         if diag["missing_columns"]:
             st.error("The billing export is missing: " + ", ".join(diag["missing_columns"]))
+            download_slot.empty()  # clear the loader
             return
         if detail is None or detail.empty:
             st.warning("No charge lines could be matched to a shipment in the listing.")
+            download_slot.empty()  # clear the loader
             return
     else:
         detail = bpo_shipment_skeleton(shipment_df)
         if detail.empty:
             st.error("No containers could be read from the shipment listing.")
+            download_slot.empty()  # clear the loader
             return
         st.info("No billing export uploaded, so the workbook carries the grouping and "
                 "BPO structure with no amounts.")
@@ -2376,6 +2405,7 @@ def render_container_breakdown():
 
     if view_detail.empty:
         st.warning("No rows match the selected group.")
+        download_slot.empty()  # clear the loader
         return
 
     views = ["Container matrix", "Per BPO", "Missing BPO by MBL", "Per group",
@@ -2433,10 +2463,11 @@ def render_container_breakdown():
             fig.update_traces(marker_line_width=0)
             st.plotly_chart(fig, use_container_width=True)
 
-    with download_slot:
+    report = cb_report_bytes(detail)
+    with download_slot.container():
         st.download_button(
             label="Download Excel breakdown",
-            data=cb_create_report(detail),
+            data=report,
             file_name=CB_REPORT_FILENAME,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="cb_download",
