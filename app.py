@@ -544,6 +544,7 @@ CB_SHIPMENT_MAP = {
     "Pack Mode": "Mode",
     "Shipping Line": "Shipping Line",
     "Carrier Master B/L": "Master B/L",
+    "Master": "Master B/L",
     "Origin": "Origin",
     "Dest.": "Destination",
     "Final Discharge Port": "Discharge Port",
@@ -969,6 +970,8 @@ BPO_LEG_BY_CODE = {
     "OHDL": BPO_LEG_ORIGIN,       # Rail Handling Fee at the load port
     "OBLF": BPO_LEG_ORIGIN,       # Bill of Lading Fee Export
     "OCCL": BPO_LEG_ORIGIN,       # Export Customs Clearance
+    "OTIF": BPO_LEG_ORIGIN,       # Terminal Infrastructure Fee - Origin
+    "OFOB": BPO_LEG_ORIGIN,       # FOB Charges (origin side of an FOB export)
     "FMF": BPO_LEG_ORIGIN,        # Freight Management Fee (NZ-side fee; confirm)
 
     # The ocean move itself and the surcharges that ride on the freight rate.
@@ -1008,10 +1011,15 @@ BPO_TBA = "TBA"
 # invoiced per shipment until the BPO arrives.
 BPO_STATUS_ISSUED = "Issued"
 BPO_STATUS_MISSING = "Missing (TBA)"
+BPO_STATUS_UNMAPPED = "Unmapped charge code"
 CB_NO_MBL = "(no MBL in listing)"
 
 
-def bpo_status(record):
+def bpo_status(record, leg=None):
+    """Issued; Missing (no BPO issued yet for this leg); or Unmapped (the
+    charge code has no leg, so no BPO can be looked up at all)."""
+    if leg == BPO_LEG_UNMAPPED:
+        return BPO_STATUS_UNMAPPED
     return BPO_STATUS_MISSING if record["BPO"] == BPO_TBA else BPO_STATUS_ISSUED
 
 
@@ -1138,7 +1146,7 @@ def bpo_annotate(detail):
 
     records = [bpo_for(g, l) for g, l in zip(out["Group"], out["Leg"])]
     out["BPO"] = [r["BPO"] for r in records]
-    out["BPO Status"] = [bpo_status(r) for r in records]
+    out["BPO Status"] = [bpo_status(r, l) for r, l in zip(records, out["Leg"])]
     out["Master B/L"] = [cb_mbl_value(v) for v in
                          (out["Master B/L"] if "Master B/L" in out.columns
                           else [None] * len(out))]
@@ -1188,7 +1196,7 @@ def bpo_shipment_skeleton(shipment_df):
                 "Group": group,
                 "Leg": leg,
                 "BPO": bpo["BPO"],
-                "BPO Status": bpo_status(bpo),
+                "BPO Status": bpo_status(bpo, leg),
                 "Master B/L": cb_mbl_value(record.get("Master B/L")),
                 "BPO Vendor": bpo["BPO Vendor"],
                 "BPO Entity": bpo["BPO Entity"],
@@ -2322,13 +2330,13 @@ def render_container_breakdown():
     placeholders = detail["Container"].astype(str).str.contains(
         r"\(not listed\)|\(cut off in listing\)", regex=True)
     if placeholders.any():
+        # Normal for long container lists: the listing export truncates them.
+        # Charges are still split across the full count, so this is a note only.
         affected = detail.loc[placeholders, "Job"].nunique()
-        st.info(
-            f"On {affected} shipment(s) the listing names fewer containers than the "
-            "shipment carries (the export cuts long container lists short, and some "
-            "bookings have no numbers issued yet). The missing containers are added "
-            "as numbered placeholders, so charges are still split across the full "
-            "container count."
+        st.caption(
+            f"Note: on {affected} shipment(s) the listing cuts the container list "
+            "short, so the unnamed containers appear as numbered placeholders. "
+            "Charges are still split across the full container count."
         )
     if diag["jobs_without_containers"]:
         st.info(
@@ -2340,8 +2348,9 @@ def render_container_breakdown():
     if not missing_bpo.empty:
         no_mbl = sorted(set(", ".join(missing_bpo.loc[
             missing_bpo["MBL #"] == CB_NO_MBL, "Jobs"]).split(", ")) - {""})
+        mbl_count = missing_bpo.loc[missing_bpo["MBL #"] != CB_NO_MBL, "MBL #"].nunique()
         st.warning(
-            f"{missing_bpo['MBL #'].nunique()} MBL(s) across "
+            f"{mbl_count} MBL(s) across "
             f"{detail.loc[detail['BPO Status'] == BPO_STATUS_MISSING, 'Job'].nunique()} "
             "shipment(s) have a leg with no BPO issued (TBA). They stay on TBA in the "
             "BPO split and are listed by MBL # in the 'Missing BPO by MBL' view and "
