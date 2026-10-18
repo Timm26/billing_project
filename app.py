@@ -492,6 +492,9 @@ def split_amount(total, parts):
     """
     if parts <= 0:
         return []
+    total = pd.to_numeric(total, errors="coerce")
+    if pd.isna(total):
+        total = 0.0
     cents = int(round(float(total) * 100))
     sign = -1 if cents < 0 else 1
     base, remainder = divmod(abs(cents), parts)
@@ -602,12 +605,47 @@ def cb_detect_job_column(df):
 
 
 def cb_read_table(file_obj, header=None):
-    """Read an uploaded .xlsx, .xls or .csv from the first sheet."""
+    """Read an uploaded .xlsx, .xls or .csv from the first sheet.
+
+    CSV exports write amounts the way they are displayed ("8,255.00"), so the
+    thousands separator is stripped on read. Excel files carry real numbers.
+    """
     name = str(getattr(file_obj, "name", "")).lower()
     file_obj.seek(0)
     if name.endswith(".csv"):
-        return pd.read_csv(file_obj, header=header)
+        return pd.read_csv(file_obj, header=header, thousands=",")
     return pd.read_excel(file_obj, header=header)
+
+
+# Billing columns that hold amounts or rates and must be numeric.
+CB_NUMERIC_BILLING_COLS = ("Amount", "Tax", "Total", "Local Total", "Local Amount",
+                           "Local Tax", "Exchange Rate")
+
+
+def cb_to_number(value):
+    """'8,255.00', ' 1 234.50 ', '(355.14)', 'NZD 12.00' -> float, else NaN."""
+    if value is None or isinstance(value, (int, float)):
+        return float("nan") if value is None else float(value)
+    text = str(value).strip()
+    if not text or text.lower() in ("nan", "none", "-"):
+        return float("nan")
+    negative = text.startswith("(") and text.endswith(")")
+    text = re.sub(r"[^0-9.\-]", "", text)
+    try:
+        number = float(text)
+    except ValueError:
+        return float("nan")
+    return -abs(number) if negative else number
+
+
+def cb_clean_billing(billing_df):
+    """Make every amount column numeric, whatever format the export used."""
+    out = billing_df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    for col in CB_NUMERIC_BILLING_COLS:
+        if col in out.columns:
+            out[col] = out[col].map(cb_to_number).astype(float)
+    return out
 
 
 def cb_read_shipment(file_obj):
@@ -766,7 +804,8 @@ def cb_build_charge_detail(billing_df, shipment_df):
     department code instead of the ports (see BPO_GROUP_BY_DEPT).
     """
     diagnostics = {"missing_columns": [], "unmatched_jobs": [],
-                   "jobs_without_containers": []}
+                   "jobs_without_containers": [], "unreadable_amounts": []}
+    billing_df = cb_clean_billing(billing_df)
     for col in (CB_CHARGE_CODE_COL, CB_JOB_COL, "Local Amount"):
         if col not in billing_df.columns:
             diagnostics["missing_columns"].append(col)
@@ -801,8 +840,10 @@ def cb_build_charge_detail(billing_df, shipment_df):
                 diagnostics["jobs_without_containers"].append(job)
 
         parts = len(group)
-        shares = {col: split_amount(pd.to_numeric(line.get(col), errors="coerce") or 0.0, parts)
-                  for col in numeric_cols}
+        if pd.isna(line.get("Local Amount")):
+            diagnostics["unreadable_amounts"].append(
+                f"{job} {str(line[CB_CHARGE_CODE_COL]).strip()}")
+        shares = {col: split_amount(line.get(col), parts) for col in numeric_cols}
 
         for i, (_, container) in enumerate(group.iterrows()):
             record = {
@@ -2211,7 +2252,8 @@ def render_container_breakdown():
         return
 
     billing = None
-    diag = {"missing_columns": [], "unmatched_jobs": [], "jobs_without_containers": []}
+    diag = {"missing_columns": [], "unmatched_jobs": [], "jobs_without_containers": [],
+            "unreadable_amounts": []}
 
     if billing_files:
         with st.spinner("Allocating charges across containers…"):
@@ -2223,8 +2265,7 @@ def render_container_breakdown():
                     st.error(f"Could not read {uploaded.name}: {e}")
             if not sheets:
                 return
-            billing = pd.concat(sheets, ignore_index=True)
-            billing.columns = [str(c).strip() for c in billing.columns]
+            billing = cb_clean_billing(pd.concat(sheets, ignore_index=True))
             detail, diag = cb_build_charge_detail(billing, shipment_df)
             detail = bpo_annotate(detail)
 
@@ -2259,6 +2300,11 @@ def render_container_breakdown():
         order = bpo_currencies_in(detail)
         st.caption("Charged ex tax, in original currency:  " + "   ·   ".join(
             f"{ccy} {by_ccy.get(ccy, 0):,.2f}" for ccy in order))
+
+    if diag.get("unreadable_amounts"):
+        st.warning(f"{len(diag['unreadable_amounts'])} charge line(s) have an amount that "
+                   "could not be read as a number and are counted as 0.00: "
+                   + ", ".join(diag["unreadable_amounts"]))
 
     if diag["unmatched_jobs"] and billing is not None:
         missing = billing[billing[CB_JOB_COL].astype(str).str.strip()
